@@ -114,6 +114,15 @@ def init_database():
                 )
             """)
 
+            # email seen state (جديد) - لتتبع آخر رسالة تم إرسالها لكل بريد
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS email_seen (
+                    email_address TEXT PRIMARY KEY,
+                    last_message_id TEXT,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
             conn.commit()
             print("✅ تم تهيئة قاعدة البيانات بنجاح")
     except Exception as e:
@@ -277,6 +286,47 @@ def unban_user_db(user_id: int) -> bool:
         conn.close()
 
 
+
+
+# ---------- Email Seen (جديد) ----------
+def get_last_seen_message_id(email_address: str) -> str:
+    """يرجع آخر message_id تم إرساله لهذا البريد (أو نص فارغ)."""
+    conn = get_db_connection()
+    if not conn:
+        return ""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT last_message_id FROM email_seen WHERE email_address=%s", (email_address.lower(),))
+            row = cur.fetchone()
+            return row[0] if row and row[0] else ""
+    except Exception as e:
+        print(f"⚠️ خطأ في get_last_seen_message_id: {e}")
+        return ""
+    finally:
+        conn.close()
+
+
+def set_last_seen_message_id(email_address: str, message_id: str) -> None:
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO email_seen(email_address, last_message_id, updated_at)
+                VALUES (%s, %s, CURRENT_TIMESTAMP)
+                ON CONFLICT(email_address)
+                DO UPDATE SET last_message_id=EXCLUDED.last_message_id, updated_at=CURRENT_TIMESTAMP
+            """, (email_address.lower(), message_id))
+            conn.commit()
+    except Exception as e:
+        print(f"⚠️ خطأ في set_last_seen_message_id: {e}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    finally:
+        conn.close()
 # ================== إدارة المشرفين (مثل كودك) ==================
 
 def get_all_admins():
@@ -588,6 +638,41 @@ def extract_otp(text):
     m = re.search(r"\b(\d{4,8})\b", text)
     return m.group(1) if m else None
 
+def html_to_text(html: str) -> str:
+    """تحويل HTML لنص بسيط (بدون مكتبات خارجية)."""
+    if not html:
+        return ""
+    # إزالة script/style
+    html = re.sub(r"<\s*(script|style)[^>]*>.*?<\s*/\s*\1\s*>", ' ', html, flags=re.IGNORECASE | re.DOTALL)
+    # استبدال بعض الوسوم بسطر جديد
+    html = re.sub(r"<\s*br\s*/?>", '\n', html, flags=re.IGNORECASE)
+    html = re.sub(r"</\s*p\s*>", '\n', html, flags=re.IGNORECASE)
+    # إزالة بقية الوسوم
+    html = re.sub(r"<[^>]+>", ' ', html)
+    # فك بعض الـ entities
+    html = html.replace('&nbsp;', ' ').replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
+    # تنظيف
+    html = re.sub(r"[\t\r ]+", ' ', html)
+    html = re.sub(r"\n{3,}", '\n\n', html)
+    return html.strip()
+
+
+def get_message_text(full: dict) -> str:
+    """يرجع أفضل نص متاح من رسالة mail.tm."""
+    if not full:
+        return ""
+    txt = (full.get("text") or "").strip()
+    if txt:
+        return txt
+    intro = (full.get("intro") or "").strip()
+    if intro:
+        return intro
+    html = (full.get("html") or "").strip()
+    if html:
+        return html_to_text(html)
+    return ""
+
+
 
 # ================== بيانات المستخدمين (مثل كودك) ==================
 
@@ -636,6 +721,128 @@ def remove_user_email(user_id, email):
     data["emails"] = [e for e in data.get("emails", []) if e.get("address") != email]
     user_database[str(user_id)] = data
     save_single_user(str(user_id), data)
+
+
+# ================== مزامنة الرسائل تلقائياً (جديد) ==================
+
+async def poll_inboxes_job(context: ContextTypes.DEFAULT_TYPE):
+    """    يفحص صناديق الوارد لكل الإيميلات المحفوظة ويرسل أي رسالة جديدة تلقائياً.
+
+    - يحفظ آخر رسالة مرسلة لكل بريد داخل جدول email_seen.
+    - لا يغيّر أي أزرار/ميزات قديمة، فقط إضافة خدمة خلفية.
+    """
+    global user_database
+
+    # تحميل أحدث نسخة من المستخدمين (لو صار تعديل أثناء التشغيل)
+    # (بدون ضغط كبير: نكتفي بالنسخة الموجودة بالRAM؛ إذا تحتاج مزامنة حقيقية أخبرني)
+
+    for uid_str, info in list(user_database.items()):
+        try:
+            user_id = int(uid_str)
+        except Exception:
+            continue
+
+        emails = (info or {}).get('emails') or []
+        if not emails:
+            continue
+
+        # لا نرسل للمحظورين
+        if (not is_admin(user_id)) and is_banned(user_id):
+            continue
+
+        for e in emails:
+            address = (e or {}).get('address')
+            token = (e or {}).get('token')
+            if not address or not token:
+                continue
+
+            last_seen = get_last_seen_message_id(address)
+            msgs = check_inbox(token) or []
+            if not msgs:
+                continue
+
+            # mail.tm غالباً يعيد الأحدث أولاً
+            new_msgs = []
+            for m in msgs:
+                mid = m.get('id')
+                if not mid:
+                    continue
+                if last_seen and mid == last_seen:
+                    break
+                new_msgs.append(m)
+
+            if not new_msgs:
+                continue
+
+            # نرسل الأقدم أولاً
+            new_msgs = list(reversed(new_msgs))[:5]
+
+            lang = get_user_language(user_id) or 'ar'
+
+            for m in new_msgs:
+                mid = m.get('id')
+                if not mid:
+                    continue
+
+                full = get_message_content(mid, token) or {}
+
+                sender = (full.get('from') or {}).get('address') or 'Unknown'
+                subject = full.get('subject') or 'No Subject'
+                date = full.get('createdAt') or ''
+                content = get_message_text(full)
+
+                if len(content) > 3500:
+                    content = content[:3500] + ("\n\n... (الرسالة طويلة جداً)" if lang == "ar" else "\n\n... (too long)")
+
+                otp = extract_otp(content)
+
+                header = '📩 وصلت رسالة جديدة' if lang == 'ar' else '📩 New message arrived'
+                from_line = f"📧 من: {sender}" if lang == 'ar' else f"📧 From: {sender}"
+                subj_line = f"📌 الموضوع: {subject}" if lang == 'ar' else f"📌 Subject: {subject}"
+                content_title = '📝 المحتوى:' if lang == 'ar' else '📝 Content:'
+
+                parts = [
+                    header,
+                    f"📧 {address}",
+                    from_line,
+                    subj_line,
+                ]
+                if date:
+                    parts.append(f"📅 {date}")
+                if otp:
+                    parts.append(f"🔢 OTP: <code>{otp}</code>")
+                parts.append('')
+                parts.append(content_title)
+                parts.append(content)
+
+                msg_text = "\n".join(parts)
+
+                # نرسل HTML لكي كود OTP يظهر واضح
+                try:
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=msg_text,
+                        parse_mode='HTML',
+                        disable_web_page_preview=True,
+                    )
+                except Exception:
+                    # إذا فشل HTML لأي سبب، نرسل كنص عادي
+                    try:
+                        await context.bot.send_message(
+                            chat_id=user_id,
+                            text=re.sub(r'<\/?.*?>', '', msg_text),
+                            disable_web_page_preview=True,
+                        )
+                    except Exception:
+                        pass
+
+                # حدث آخر رسالة مرسلة لهذا البريد
+                set_last_seen_message_id(address, mid)
+
+            # تأكيد آخر رسالة هي الأحدث (حماية)
+            newest_id = msgs[0].get('id')
+            if newest_id:
+                set_last_seen_message_id(address, newest_id)
 
 
 # ================== نصوص (مختصر) ==================
@@ -1007,7 +1214,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sender = full.get("from", {}).get("address", "Unknown")
         subject = full.get("subject", "No Subject")
         date = full.get("createdAt", "Unknown")
-        content = full.get("text", full.get("intro", "")) or ""
+        content = get_message_text(full)
 
         otp = extract_otp(content)
         content = content[:3500] + ("\n\n... (الرسالة طويلة جداً)" if lang=="ar" else "\n\n... (too long)") if len(content) > 3500 else content
@@ -1715,6 +1922,16 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
     application.add_error_handler(error_handler)
+
+    # ✅ جديد: فحص تلقائي لصندوق الوارد (mail.tm) وإرسال الرسائل فور وصولها
+    try:
+        if application.job_queue:
+            application.job_queue.run_repeating(poll_inboxes_job, interval=20, first=10, name="poll_inboxes")
+            print("✅ Auto inbox polling enabled (every 20s)")
+        else:
+            print("⚠️ JobQueue غير متاح - لن يعمل الفحص التلقائي")
+    except Exception as e:
+        print(f"⚠️ Failed to start polling job: {e}")
 
     print("🤖 Bot is running (polling)...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
