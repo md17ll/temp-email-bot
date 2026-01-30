@@ -1811,6 +1811,71 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_settings")]]))
         return
 
+    # حذف عضو من قاعدة البيانات (bot_users)
+    if waiting_for == "delete_member" and is_admin(user_id):
+        target_text = (update.message.text or "").strip()
+        context.user_data["waiting_for"] = None
+
+        # تحقق من إدخال رقم
+        if not target_text.isdigit():
+            await update.message.reply_text(
+                "❌ الرجاء إرسال ID رقمي صحيح.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_members")]])
+            )
+            return
+
+        target_id = int(target_text)
+
+        # لا تسمح بحذف مشرف
+        if is_admin(target_id):
+            await update.message.reply_text(
+                "⛔ لا يمكن حذف مشرف.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_members")]])
+            )
+            return
+
+        conn = get_db_connection()
+        if not conn:
+            await update.message.reply_text(
+                "❌ تعذر الاتصال بقاعدة البيانات.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_members")]])
+            )
+            return
+
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM bot_users WHERE telegram_id=%s", (target_id,))
+                deleted = cur.rowcount
+                conn.commit()
+        except Exception as e:
+            try:
+                conn.rollback()
+            except:
+                pass
+            deleted = 0
+            print(f"❌ خطأ حذف عضو: {e}")
+        finally:
+            try:
+                conn.close()
+            except:
+                pass
+
+        # إزالة من الذاكرة
+        try:
+            if str(target_id) in user_database:
+                user_database.pop(str(target_id), None)
+            if target_id in user_database:
+                user_database.pop(target_id, None)
+        except:
+            pass
+
+        await update.message.reply_text(
+            "✅ تم حذف المستخدم بنجاح." if deleted else "❌ المستخدم غير موجود.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_members")]])
+        )
+        return
+
+
     # إذاعة للكل
     if waiting_for == "broadcast_all" and is_admin(user_id):
         context.user_data["waiting_for"] = None
