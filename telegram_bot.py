@@ -285,26 +285,6 @@ def unban_user_db(user_id: int) -> bool:
     finally:
         conn.close()
 
-def delete_user_db(target_id: int) -> bool:
-    """حذف عضو نهائياً من جدول bot_users."""
-    conn = get_db_connection()
-    if not conn:
-        return False
-    try:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM bot_users WHERE telegram_id=%s", (target_id,))
-            conn.commit()
-            return cur.rowcount > 0
-    except Exception as e:
-        print(f"⚠️ خطأ في delete_user_db: {e}")
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        return False
-    finally:
-        conn.close()
-
 
 
 
@@ -1183,7 +1163,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # عرض صندوق وارد إيميل
     if data.startswith("inbox_"):
-        email_index = int(data.split("_")[1])
+        idx_str = data.split("_", 1)[1]
+        if not idx_str.isdigit():
+            return
+        email_index = int(idx_str)
         emails = get_user_emails(user_id)
         if email_index >= len(emails):
             return
@@ -1213,6 +1196,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # تفاصيل رسالة
     if data.startswith("msg_"):
         parts = data.split("_")
+        if len(parts) < 3 or (not parts[1].isdigit()) or (not parts[2].isdigit()):
+            return
         email_index = int(parts[1])
         msg_index = int(parts[2])
         emails = get_user_emails(user_id)
@@ -1252,7 +1237,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # عرض تفاصيل إيميل
     if data.startswith("view_email_"):
-        email_index = int(data.split("_")[2])
+        idx_str = data.split("_", 2)[2]
+        if not idx_str.isdigit():
+            return
+        email_index = int(idx_str)
         emails = get_user_emails(user_id)
         if email_index >= len(emails):
             return
@@ -1268,7 +1256,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # تأكيد حذف إيميل
     if data.startswith("confirm_delete_") and data != "confirm_delete_all":
-        email_index = int(data.split("_")[2])
+        idx_str = data.split("_", 2)[2]
+        if not idx_str.isdigit():
+            return
+        email_index = int(idx_str)
         emails = get_user_emails(user_id)
         if email_index >= len(emails):
             return
@@ -1282,10 +1273,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("delete_") and not data.startswith("delete_all"):
-        _part = data.split("_", 1)[1] if "_" in data else ""
-        if not _part.isdigit():
+        idx_str = data.split("_", 1)[1]
+        if not idx_str.isdigit():
             return
-        email_index = int(_part)
+        email_index = int(idx_str)
         emails = get_user_emails(user_id)
         if email_index >= len(emails):
             return
@@ -1537,7 +1528,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("✅ الأعضاء النشطين", callback_data="users_list_active")],
             [InlineKeyboardButton("🏆 الأكثر إيميلات", callback_data="users_list_top")],
             [InlineKeyboardButton("🔍 بحث عن عضو", callback_data="search_member")],
-            [InlineKeyboardButton("🗑 حذف عضو", callback_data="delete_member")],
             [InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="admin_panel")]
         ])
         await query.edit_message_text(text, reply_markup=kb)
@@ -1631,15 +1621,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
         return
 
-    if data == "delete_member":
-        if not is_admin(user_id):
-            return
-        context.user_data["waiting_for"] = "delete_member"
-        await query.edit_message_text("🗑 أرسل ID العضو لحذفه نهائياً من قاعدة البيانات:",
-                                      reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_members")]]))
-        return
-
-
     if data == "add_admin":
         if user_id != ADMIN_ID:
             return
@@ -1667,7 +1648,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("confirm_remove_admin_"):
         if user_id != ADMIN_ID:
             return
-        aid = int(data.replace("confirm_remove_admin_", ""))
+        aid_str = data.replace("confirm_remove_admin_", "")
+        if not aid_str.isdigit():
+            return
+        aid = int(aid_str)
         ok = remove_admin(aid)
         await query.edit_message_text("✅ تم إزالة المشرف" if ok else "❌ فشل إزالة المشرف",
                                       reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_admins")]]))
@@ -1888,24 +1872,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_members")]]))
         return
 
-
-    # 🗑 حذف عضو نهائياً
-    if waiting_for == "delete_member" and is_admin(user_id):
-        raw = (update.message.text or "").strip().replace("@", "")
-        if not raw.isdigit():
-            await update.message.reply_text("❌ أرسل رقم ID فقط (مثال: 123456789)",
-                                            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_members")]]))
-            return
-        target_id = int(raw)
-        ok = delete_user_db(target_id)
-        if ok:
-            # حذف من الذاكرة أيضاً (إن وجد)
-            user_database.pop(str(target_id), None)
-        context.user_data["waiting_for"] = None
-        await update.message.reply_text("✅ تم حذف العضو نهائياً من قاعدة البيانات" if ok else "❌ لم يتم العثور على هذا العضو في قاعدة البيانات",
-                                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_members")]]))
-        return
-
     # ✅ تعيين رسالة الترحيب (جديد)
     if waiting_for == "welcome_message" and is_admin(user_id):
         msg = (update.message.text or "").strip()
@@ -1985,7 +1951,7 @@ def main():
         print(f"⚠️ Failed to start polling job: {e}")
 
     print("🤖 Bot is running (polling)...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    application.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
