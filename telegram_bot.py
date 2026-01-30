@@ -286,29 +286,27 @@ def unban_user_db(user_id: int) -> bool:
         conn.close()
 
 
-
-
-
 # ---------- Delete Member (جديد) ----------
-def delete_member_from_bot_users(telegram_id: int) -> bool:
-    """يحذف المستخدم نهائياً من جدول bot_users. يرجع True إذا تم الحذف."""
+def delete_bot_user_db(user_id: int) -> bool:
+    """يحذف المستخدم من جدول bot_users فقط."""
     conn = get_db_connection()
     if not conn:
         return False
     try:
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM bot_users WHERE telegram_id=%s", (telegram_id,))
+            cur.execute("DELETE FROM bot_users WHERE telegram_id=%s", (user_id,))
             conn.commit()
             return cur.rowcount > 0
     except Exception as e:
-        print(f"⚠️ خطأ في delete_member_from_bot_users: {e}")
-        try:
-            conn.rollback()
-        except Exception:
-            pass
+        print(f"⚠️ خطأ في delete_bot_user_db: {e}")
+        conn.rollback()
         return False
     finally:
         conn.close()
+
+
+
+
 
 # ---------- Email Seen (جديد) ----------
 def get_last_seen_message_id(email_address: str) -> str:
@@ -1597,19 +1595,19 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "search_member":
         if not is_admin(user_id):
             return
-        context.user_data["waiting_for"] = "search_member"
-        await query.edit_message_text("🔍 أرسل ID أو username أو اسم للبحث:",
-                                      reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_members")]]))
-        return
 
     if data == "delete_member":
         if not is_admin(user_id):
             return
         context.user_data["waiting_for"] = "delete_member"
-        await query.edit_message_text("🗑 أرسل ID المستخدم لحذفه نهائياً من قاعدة البيانات (bot_users):\nمثال: 123456789",
+        await query.edit_message_text("🗑 أرسل ID المستخدم المراد حذفه (أرقام فقط):",
                                       reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_members")]]))
         return
 
+        context.user_data["waiting_for"] = "search_member"
+        await query.edit_message_text("🔍 أرسل ID أو username أو اسم للبحث:",
+                                      reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_members")]]))
+        return
 
     # ================== إدارة المشرفين (للرئيسي فقط) ==================
     if data == "section_admins":
@@ -1887,37 +1885,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_members")]]))
         return
 
-    # 🗑 حذف عضو (جديد) - من قسم الأدمن فقط
-    if waiting_for == "delete_member" and is_admin(user_id):
-        raw = (update.message.text or "").strip()
-        context.user_data["waiting_for"] = None
-        try:
-            target_id = int(raw)
-        except Exception:
-            await update.message.reply_text("❌ ارسل ID صحيح (أرقام فقط)",
-                                            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_members")]]))
-            return
-
-        # منع حذف أي مشرف (حماية)
-        if is_admin(target_id):
-            await update.message.reply_text("⚠️ لا يمكن حذف مشرف من هنا.",
-                                            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_members")]]))
-            return
-
-        ok = delete_member_from_bot_users(target_id)
-        if ok:
-            try:
-                user_database.pop(str(target_id), None)
-            except Exception:
-                pass
-            await update.message.reply_text("✅ تم حذف المستخدم نهائياً من قاعدة البيانات",
-                                            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_members")]]))
-        else:
-            await update.message.reply_text("❌ المستخدم غير موجود أو فشل الحذف",
-                                            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_members")]]))
-        return
-
-
     # ✅ تعيين رسالة الترحيب (جديد)
     if waiting_for == "welcome_message" and is_admin(user_id):
         msg = (update.message.text or "").strip()
@@ -1947,15 +1914,43 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ✅ فك حظر مستخدم (جديد)
     if waiting_for == "unban_user" and is_admin(user_id):
         context.user_data["waiting_for"] = None
-        try:
-            target_id = int((update.message.text or "").strip())
-        except:
+        raw = (update.message.text or "").strip()
+        if not raw.isdigit():
             await update.message.reply_text("❌ ارسل ID صحيح",
                                             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_ban")]]))
             return
+        target_id = int(raw)
         ok = unban_user_db(target_id)
         await update.message.reply_text("✅ تم فك الحظر" if ok else "⚠️ المستخدم غير محظور أصلاً",
                                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_ban")]]))
+        return
+
+
+
+    # ✅ حذف عضو من bot_users (جديد)
+    if waiting_for == "delete_member" and is_admin(user_id):
+        raw = (update.message.text or "").strip()
+        if not raw.isdigit():
+            await update.message.reply_text("❌ أرسل ID رقمي فقط",
+                                            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_members")]]))
+            return
+
+        target_id = int(raw)
+
+        # منع حذف أي مشرف
+        if target_id == ADMIN_ID or is_admin(target_id):
+            context.user_data["waiting_for"] = None
+            await update.message.reply_text("⚠️ لا يمكن حذف مشرف",
+                                            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_members")]]))
+            return
+
+        ok = delete_bot_user_db(target_id)
+        # حذف من الذاكرة (إن وجد)
+        user_database.pop(str(target_id), None)
+
+        context.user_data["waiting_for"] = None
+        await update.message.reply_text("✅ تم حذف المستخدم" if ok else "⚠️ المستخدم غير موجود",
+                                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_members")]]))
         return
 
 
