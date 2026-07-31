@@ -1,24 +1,31 @@
 #!/usr/bin/env python3
 """
-بوت تلجرام لإنشاء إيميلات مؤقتة متعددة (mail.tm)
-+ لوحة مشرف
-+ اشتراك إجباري قوي (يفحص كل مرة)
-+ رسالة ترحيب قابلة للتعديل
-+ حظر / فك حظر مستخدمين
+بوت تلجرام لإنشاء إيميلات مؤقتة متعددة عبر mail.tm.
+
+الميزات:
+- واجهة عربية فقط.
+- لوحة مشرف وإدارة أعضاء.
+- اشتراك إجباري وحظر وإذاعة.
+- رسالة ترحيب مدمجة بالقائمة الرئيسية.
+- حد قابل للتعديل لعدد الإيميلات لكل مستخدم.
+- أزرار تلجرام ملوّنة.
 """
 
+import asyncio
 import os
 import re
-import json
-import requests
+import time
+import traceback
+from html import escape, unescape
+
 import psycopg2
+import requests
 from psycopg2.extras import Json, RealDictCursor
-from datetime import datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
-    CommandHandler,
     CallbackQueryHandler,
+    CommandHandler,
     ContextTypes,
     MessageHandler,
     filters,
@@ -32,9 +39,12 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 # توجيه رسائل المستخدمين للأدمن
 forwarding_enabled = False
 
-# حالة تشغيل البوت (الأدمن دايمًا يقدر يدخل)
+# حالة تشغيل البوت (الأدمن دائماً يستطيع الدخول)
 bot_active = True
 bot_offline_message = ""
+
+# 0 يعني غير محدود إلى أن يحدد الأدمن رقماً من لوحة التحكم
+DEFAULT_EMAIL_LIMIT = 0
 
 # ================== قاعدة البيانات ==================
 
@@ -123,6 +133,9 @@ def init_database():
                 )
             """)
 
+            # الواجهة أصبحت عربية فقط؛ توحيد بيانات المستخدمين القديمة دون تغيير بنية الجدول.
+            cur.execute("UPDATE bot_users SET language='ar' WHERE language IS DISTINCT FROM 'ar'")
+
             conn.commit()
             print("✅ تم تهيئة قاعدة البيانات بنجاح")
     except Exception as e:
@@ -145,7 +158,7 @@ def load_user_data():
         for row in rows:
             user_id = str(row["telegram_id"])
             user_data[user_id] = {
-                "lang": row.get("language"),
+                "lang": "ar",
                 "first_name": row.get("first_name", "") or "",
                 "last_name": row.get("last_name", "") or "",
                 "username": row.get("username", "") or "",
@@ -159,10 +172,10 @@ def load_user_data():
         conn.close()
 
 
-def save_single_user(telegram_id, user_info):
+def save_single_user(telegram_id, user_info) -> bool:
     conn = get_db_connection()
     if not conn:
-        return
+        return False
     try:
         with conn.cursor() as cur:
             cur.execute("""
@@ -185,9 +198,11 @@ def save_single_user(telegram_id, user_info):
                 Json(user_info.get("emails", [])),
             ))
             conn.commit()
+            return True
     except Exception as e:
         print(f"❌ خطأ في حفظ البيانات: {e}")
         conn.rollback()
+        return False
     finally:
         conn.close()
 
@@ -229,6 +244,30 @@ def set_setting(key: str, value: str) -> bool:
         return False
     finally:
         conn.close()
+
+
+def get_email_limit() -> int:
+    """يرجع الحد العام لكل مستخدم؛ صفر يعني غير محدود."""
+    raw_value = get_setting("email_limit", str(DEFAULT_EMAIL_LIMIT)).strip()
+    try:
+        return max(0, int(raw_value))
+    except (TypeError, ValueError):
+        return DEFAULT_EMAIL_LIMIT
+
+
+def build_main_menu_text(user_id: int) -> str:
+    """دمج رسالة الترحيب مع القائمة الرئيسية في رسالة واحدة."""
+    emails_count = len(get_user_emails(user_id))
+    menu_text = get_text("ar", "main_menu", emails_count=emails_count)
+    welcome_message = get_setting("welcome_message", "").strip()
+    if welcome_message:
+        return f"{welcome_message}\n\n{menu_text}"
+    return menu_text
+
+
+def telegram_html(value) -> str:
+    """حماية النصوص الخارجية قبل إرسالها بوضع HTML في تلجرام."""
+    return escape(str(value or ""), quote=False)
 
 
 # ---------- Ban (جديد) ----------
@@ -327,6 +366,61 @@ def set_last_seen_message_id(email_address: str, message_id: str) -> None:
             pass
     finally:
         conn.close()
+def delete_email_seen_records(addresses) -> None:
+    clean_addresses = [str(address).lower() for address in addresses if address]
+    if not clean_addresses:
+        return
+
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM email_seen WHERE email_address = ANY(%s)", (clean_addresses,))
+            conn.commit()
+    except Exception as e:
+        print(f"⚠️ خطأ في تنظيف سجل الرسائل: {e}")
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+def find_user_by_username_or_id(search_value: str):
+    """البحث الدقيق عن عضو عبر ID أو username."""
+    query = str(search_value or "").strip().lstrip("@").lower()
+    if not query:
+        return None
+
+    if query.isdigit() and query in user_database:
+        return int(query), user_database[query]
+
+    for uid, info in user_database.items():
+        username = str((info or {}).get("username") or "").lower()
+        if username and username == query:
+            return int(uid), info
+    return None
+
+
+def clear_user_emails(user_id: int):
+    """حذف إيميلات العضو من بيانات البوت فقط، مع تنظيف سجل الرسائل."""
+    uid = str(user_id)
+    if uid not in user_database:
+        return False, 0
+
+    data = user_database[uid]
+    old_emails = list(data.get("emails") or [])
+    addresses = [(item or {}).get("address") for item in old_emails]
+    data["emails"] = []
+
+    if not save_single_user(uid, data):
+        data["emails"] = old_emails
+        return False, 0
+
+    user_database[uid] = data
+    delete_email_seen_records(addresses)
+    return True, len(old_emails)
+
+
 # ================== إدارة المشرفين (مثل كودك) ==================
 
 def get_all_admins():
@@ -519,68 +613,106 @@ def toggle_subscription(channel_username):
         conn.close()
 
 
-# ================== اشتراك إجباري قوي (جديد/محسن) ==================
+# ================== اشتراك إجباري قوي ==================
 
 async def check_user_subscription_strict(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """
-    قوي: يفحص كل مرة - إذا خرج من القناة يرجع False فورًا
-    """
+    """يفحص الاشتراك كل مرة، ولا يمنع المستخدم بسبب عطل شبكة مؤقت."""
     channel_info = get_channel_info()
-    if not channel_info:
-        return True
-
-    if not channel_info.get("subscription_enabled"):
+    if not channel_info or not channel_info.get("subscription_enabled"):
         return True
 
     channel_username = channel_info["channel_username"]
     channel_id = channel_info.get("channel_id")
     chat_identifier = channel_id if channel_id else f"@{channel_username}"
 
-    try:
-        member = await context.bot.get_chat_member(chat_identifier, user_id)
-        return member.status in ("member", "administrator", "creator")
-    except Exception as e:
-        # إذا في مشكلة بالقناة نفسها، الأفضل منع (حتى يكون "صارم")
-        print(f"⚠️ check_user_subscription_strict error: {e}")
-        return False
+    for attempt in range(2):
+        try:
+            member = await context.bot.get_chat_member(chat_identifier, user_id)
+            return member.status in ("member", "administrator", "creator")
+        except Exception as error:
+            error_text = str(error).lower()
+            temporary_error = any(term in error_text for term in (
+                "readerror", "timeout", "timed out", "network", "connection",
+                "bad gateway", "temporarily unavailable", "server error",
+            ))
+            if temporary_error and attempt == 0:
+                await asyncio.sleep(1.5)
+                continue
+
+            print(
+                f"⚠️ فشل فحص الاشتراك للمستخدم {user_id}: "
+                f"{type(error).__name__}: {error}"
+            )
+            return True if temporary_error else False
+
+    return True
 
 
-def subscription_prompt(lang: str, channel_username: str, message: str):
-    text_ar = (
+def subscription_prompt(_lang: str, channel_username: str, message: str):
+    text = (
         "⚠️ يجب عليك الاشتراك في القناة للاستخدام\n\n"
         f"🔗 القناة: @{channel_username}\n\n"
         f"{message}\n\n"
         "بعد الاشتراك اضغط: ✅ التحقق من الاشتراك"
     )
-    text_en = (
-        "⚠️ You must join the channel to use the bot\n\n"
-        f"🔗 Channel: @{channel_username}\n\n"
-        f"{message}\n\n"
-        "After joining press: ✅ Verify Subscription"
-    )
-    text = text_ar if lang == "ar" else text_en
-
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 الانضمام للقناة" if lang == "ar" else "📢 Join Channel",
-                              url=f"https://t.me/{channel_username}")],
-        [InlineKeyboardButton("✅ التحقق من الاشتراك" if lang == "ar" else "✅ Verify Subscription",
-                              callback_data="verify_subscription")]
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "📢 الانضمام للقناة",
+            url=f"https://t.me/{channel_username}",
+            style="primary",
+        )],
+        [InlineKeyboardButton(
+            "✅ التحقق من الاشتراك",
+            callback_data="verify_subscription",
+            style="success",
+        )],
     ])
-    return text, kb
+    return text, keyboard
 
+# ================== mail.tm API ==================
 
-# ================== mail.tm API (مثل كودك) ==================
+def mail_request(method: str, path: str, **kwargs):
+    """طلب إلى mail.tm مع إعادة محاولة للأخطاء المؤقتة."""
+    last_error = None
+    supplied_headers = kwargs.pop("headers", {}) or {}
+    request_headers = {"User-Agent": "TelegramTempMailBot/3.0", **supplied_headers}
+
+    for attempt in range(3):
+        try:
+            response = requests.request(
+                method,
+                f"{API}{path}",
+                timeout=(5, 20),
+                headers=request_headers,
+                **kwargs,
+            )
+            if response.status_code not in (429, 500, 502, 503, 504):
+                return response
+            print(f"⚠️ mail.tm {path}: HTTP {response.status_code}")
+        except requests.RequestException as error:
+            last_error = error
+            print(f"⚠️ mail.tm {path}: {type(error).__name__}: {error}")
+
+        if attempt < 2:
+            time.sleep(2 ** attempt)
+
+    if last_error:
+        print(f"❌ فشل الاتصال النهائي بـ mail.tm: {last_error}")
+    return None
+
 
 def get_available_domains():
+    response = mail_request("GET", "/domains")
+    if response is None or response.status_code != 200:
+        return []
     try:
-        r = requests.get(f"{API}/domains", timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            domains = data.get("hydra:member", [])
-            return [d["domain"] for d in domains] if domains else []
-    except Exception as e:
-        print(f"⚠️ get_available_domains: {e}")
-    return []
+        data = response.json()
+    except ValueError as error:
+        print(f"⚠️ رد النطاقات غير صالح: {error}")
+        return []
+
+    domains = data.get("hydra:member") or []
+    return [item.get("domain") for item in domains if item.get("domain")]
 
 
 def create_email():
@@ -589,120 +721,156 @@ def create_email():
         if not domains:
             return None, None
 
-        import random, string
-        username = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
+        import random
+        import string
+
+        username = "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
         email_address = f"{username}@{domains[0]}"
         password = "TempMail123"
 
-        r = requests.post(f"{API}/accounts", json={"address": email_address, "password": password}, timeout=10)
-        if r.status_code != 201:
+        response = mail_request(
+            "POST",
+            "/accounts",
+            json={"address": email_address, "password": password},
+        )
+        if response is None or response.status_code != 201:
             return None, None
 
-        tr = requests.post(f"{API}/token", json={"address": email_address, "password": password}, timeout=10)
-        if tr.status_code != 200:
+        token_response = mail_request(
+            "POST",
+            "/token",
+            json={"address": email_address, "password": password},
+        )
+        if token_response is None or token_response.status_code != 200:
             return None, None
 
-        token = tr.json().get("token")
+        token = token_response.json().get("token")
         return (email_address, token) if token else (None, None)
-    except Exception as e:
-        print(f"❌ create_email: {e}")
+    except Exception as error:
+        print(f"❌ create_email: {type(error).__name__}: {error}")
         return None, None
 
 
 def check_inbox(token):
-    try:
-        headers = {"Authorization": f"Bearer {token}"}
-        r = requests.get(f"{API}/messages", headers=headers, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            return data.get("hydra:member", [])
+    headers = {"Authorization": f"Bearer {token}"}
+    response = mail_request("GET", "/messages", headers=headers)
+    if response is None:
         return None
-    except Exception as e:
-        print(f"⚠️ check_inbox: {e}")
-        return None
+    if response.status_code == 200:
+        try:
+            return response.json().get("hydra:member", [])
+        except ValueError as error:
+            print(f"⚠️ رد صندوق الوارد غير صالح: {error}")
+    elif response.status_code == 401:
+        print("⚠️ توكن البريد غير صالح أو منتهي")
+    else:
+        print(f"⚠️ فشل فحص الصندوق: HTTP {response.status_code}")
+    return None
 
 
 def get_message_content(message_id, token):
+    headers = {"Authorization": f"Bearer {token}"}
+    response = mail_request("GET", f"/messages/{message_id}", headers=headers)
+    if response is None or response.status_code != 200:
+        return None
     try:
-        headers = {"Authorization": f"Bearer {token}"}
-        r = requests.get(f"{API}/messages/{message_id}", headers=headers, timeout=10)
-        return r.json() if r.status_code == 200 else None
-    except Exception as e:
-        print(f"⚠️ get_message_content: {e}")
+        return response.json()
+    except ValueError as error:
+        print(f"⚠️ رد محتوى الرسالة غير صالح: {error}")
         return None
 
 
 def extract_otp(text):
     if not text:
         return None
-    m = re.search(r"\b(\d{4,8})\b", text)
-    return m.group(1) if m else None
+    match = re.search(r"\b(\d{4,8})\b", str(text))
+    return match.group(1) if match else None
 
-def html_to_text(html: str) -> str:
-    """تحويل HTML لنص بسيط (بدون مكتبات خارجية)."""
-    if not html:
+
+def normalize_text_value(value) -> str:
+    if isinstance(value, list):
+        return "\n".join(str(item) for item in value if item)
+    return str(value or "")
+
+
+def html_to_text(html_value) -> str:
+    """تحويل HTML إلى نص آمن للعرض داخل تلجرام."""
+    html_text = normalize_text_value(html_value)
+    if not html_text:
         return ""
-    # إزالة script/style
-    html = re.sub(r"<\s*(script|style)[^>]*>.*?<\s*/\s*\1\s*>", ' ', html, flags=re.IGNORECASE | re.DOTALL)
-    # استبدال بعض الوسوم بسطر جديد
-    html = re.sub(r"<\s*br\s*/?>", '\n', html, flags=re.IGNORECASE)
-    html = re.sub(r"</\s*p\s*>", '\n', html, flags=re.IGNORECASE)
-    # إزالة بقية الوسوم
-    html = re.sub(r"<[^>]+>", ' ', html)
-    # فك بعض الـ entities
-    html = html.replace('&nbsp;', ' ').replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
-    # تنظيف
-    html = re.sub(r"[\t\r ]+", ' ', html)
-    html = re.sub(r"\n{3,}", '\n\n', html)
-    return html.strip()
+
+    # فك الترميز أولاً حتى تُحذف الوسوم التي وصلت بصورة &lt;tag&gt;.
+    html_text = unescape(html_text)
+    html_text = re.sub(
+        r"<\s*(script|style)[^>]*>.*?<\s*/\s*\1\s*>",
+        " ",
+        html_text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    html_text = re.sub(r"<\s*br\s*/?>", "\n", html_text, flags=re.IGNORECASE)
+    html_text = re.sub(r"</\s*p\s*>", "\n", html_text, flags=re.IGNORECASE)
+    html_text = re.sub(r"<[^>]+>", " ", html_text)
+    html_text = re.sub(r"[\t\r ]+", " ", html_text)
+    html_text = re.sub(r"\n{3,}", "\n\n", html_text)
+    return html_text.strip()
 
 
 def get_message_text(full: dict) -> str:
     """يرجع أفضل نص متاح من رسالة mail.tm."""
     if not full:
         return ""
-    txt = (full.get("text") or "").strip()
-    if txt:
-        return txt
-    intro = (full.get("intro") or "").strip()
+
+    text_value = normalize_text_value(full.get("text")).strip()
+    if text_value:
+        return text_value
+
+    intro = normalize_text_value(full.get("intro")).strip()
     if intro:
         return intro
-    html = (full.get("html") or "").strip()
-    if html:
-        return html_to_text(html)
-    return ""
 
+    html_value = full.get("html")
+    return html_to_text(html_value) if html_value else ""
 
-
-# ================== بيانات المستخدمين (مثل كودك) ==================
+# ================== بيانات المستخدمين ==================
 
 init_database()
 user_database = load_user_data()
 
+
 def get_user_data(user_id):
     uid = str(user_id)
     if uid not in user_database:
-        user_database[uid] = {"lang": None, "emails": []}
+        user_database[uid] = {"lang": "ar", "emails": []}
         save_single_user(uid, user_database[uid])
+    else:
+        user_database[uid]["lang"] = "ar"
     return user_database[uid]
+
 
 def get_user_emails(user_id):
     return get_user_data(user_id).get("emails", [])
 
-def get_user_language(user_id):
-    return get_user_data(user_id).get("lang")
+
+def get_user_language(_user_id):
+    return "ar"
+
 
 def update_user_info(user_id, user):
+    if user is None:
+        return
     data = get_user_data(user_id)
+    data["lang"] = "ar"
     data["first_name"] = user.first_name or ""
     data["last_name"] = user.last_name or ""
     data["username"] = user.username or ""
     user_database[str(user_id)] = data
     save_single_user(str(user_id), data)
 
-def set_user_language(user_id, lang, user=None):
+
+def set_user_language(user_id, _lang="ar", user=None):
+    """للتوافق مع البيانات القديمة؛ اللغة ثابتة دائماً على العربية."""
     data = get_user_data(user_id)
-    data["lang"] = lang
+    data["lang"] = "ar"
     if user:
         data["first_name"] = user.first_name or ""
         data["last_name"] = user.last_name or ""
@@ -710,286 +878,256 @@ def set_user_language(user_id, lang, user=None):
     user_database[str(user_id)] = data
     save_single_user(str(user_id), data)
 
+
 def add_user_email(user_id, email, token):
     data = get_user_data(user_id)
-    data["emails"].append({"address": email, "token": token})
+    data.setdefault("emails", []).append({"address": email, "token": token})
     user_database[str(user_id)] = data
     save_single_user(str(user_id), data)
+
 
 def remove_user_email(user_id, email):
     data = get_user_data(user_id)
-    data["emails"] = [e for e in data.get("emails", []) if e.get("address") != email]
+    data["emails"] = [item for item in data.get("emails", []) if item.get("address") != email]
     user_database[str(user_id)] = data
-    save_single_user(str(user_id), data)
+    if save_single_user(str(user_id), data):
+        delete_email_seen_records([email])
 
-
-# ================== مزامنة الرسائل تلقائياً (جديد) ==================
+# ================== مزامنة الرسائل تلقائياً ==================
 
 async def poll_inboxes_job(context: ContextTypes.DEFAULT_TYPE):
-    """    يفحص صناديق الوارد لكل الإيميلات المحفوظة ويرسل أي رسالة جديدة تلقائياً.
-
-    - يحفظ آخر رسالة مرسلة لكل بريد داخل جدول email_seen.
-    - لا يغيّر أي أزرار/ميزات قديمة، فقط إضافة خدمة خلفية.
-    """
-    global user_database
-
-    # تحميل أحدث نسخة من المستخدمين (لو صار تعديل أثناء التشغيل)
-    # (بدون ضغط كبير: نكتفي بالنسخة الموجودة بالRAM؛ إذا تحتاج مزامنة حقيقية أخبرني)
-
+    """يفحص الإيميلات المحفوظة ويرسل الرسائل الجديدة دون تعليم الفاشل كمقروء."""
     for uid_str, info in list(user_database.items()):
         try:
             user_id = int(uid_str)
-        except Exception:
+        except (TypeError, ValueError):
             continue
 
-        emails = (info or {}).get('emails') or []
-        if not emails:
+        emails = (info or {}).get("emails") or []
+        if not emails or ((not is_admin(user_id)) and is_banned(user_id)):
             continue
 
-        # لا نرسل للمحظورين
-        if (not is_admin(user_id)) and is_banned(user_id):
-            continue
-
-        for e in emails:
-            address = (e or {}).get('address')
-            token = (e or {}).get('token')
+        for email_info in emails:
+            address = (email_info or {}).get("address")
+            token = (email_info or {}).get("token")
             if not address or not token:
                 continue
 
             last_seen = get_last_seen_message_id(address)
-            msgs = check_inbox(token) or []
-            if not msgs:
+            messages = await asyncio.to_thread(check_inbox, token)
+            if not messages:
                 continue
 
-            # mail.tm غالباً يعيد الأحدث أولاً
-            new_msgs = []
-            for m in msgs:
-                mid = m.get('id')
-                if not mid:
+            new_messages = []
+            for message in messages:
+                message_id = (message or {}).get("id")
+                if not message_id:
                     continue
-                if last_seen and mid == last_seen:
+                if last_seen and message_id == last_seen:
                     break
-                new_msgs.append(m)
+                new_messages.append(message)
 
-            if not new_msgs:
+            if not new_messages:
                 continue
 
-            # نرسل الأقدم أولاً
-            new_msgs = list(reversed(new_msgs))[:5]
-
-            lang = get_user_language(user_id) or 'ar'
-
-            for m in new_msgs:
-                mid = m.get('id')
-                if not mid:
+            # mail.tm يعيد الأحدث أولاً؛ نرسل الأقدم أولاً.
+            for message in list(reversed(new_messages))[:5]:
+                message_id = (message or {}).get("id")
+                if not message_id:
                     continue
 
-                full = get_message_content(mid, token) or {}
+                full = await asyncio.to_thread(get_message_content, message_id, token) or {}
+                sender_raw = (full.get("from") or {}).get("address") or "غير معروف"
+                subject_raw = full.get("subject") or "بدون موضوع"
+                date_raw = full.get("createdAt") or ""
+                content_raw = get_message_text(full)
+                if len(content_raw) > 3500:
+                    content_raw = content_raw[:3500] + "\n\n... (الرسالة طويلة جداً)"
 
-                sender = (full.get('from') or {}).get('address') or 'Unknown'
-                subject = full.get('subject') or 'No Subject'
-                date = full.get('createdAt') or ''
-                content = get_message_text(full)
-
-                if len(content) > 3500:
-                    content = content[:3500] + ("\n\n... (الرسالة طويلة جداً)" if lang == "ar" else "\n\n... (too long)")
-
-                otp = extract_otp(content)
-
-                header = '📩 وصلت رسالة جديدة' if lang == 'ar' else '📩 New message arrived'
-                from_line = f"📧 من: {sender}" if lang == 'ar' else f"📧 From: {sender}"
-                subj_line = f"📌 الموضوع: {subject}" if lang == 'ar' else f"📌 Subject: {subject}"
-                content_title = '📝 المحتوى:' if lang == 'ar' else '📝 Content:'
-
-                parts = [
-                    header,
-                    f"📧 {address}",
-                    from_line,
-                    subj_line,
+                otp = extract_otp(content_raw)
+                html_parts = [
+                    "📩 وصلت رسالة جديدة",
+                    f"📧 {telegram_html(address)}",
+                    f"📧 من: {telegram_html(sender_raw)}",
+                    f"📌 الموضوع: {telegram_html(subject_raw)}",
                 ]
-                if date:
-                    parts.append(f"📅 {date}")
+                plain_parts = [
+                    "📩 وصلت رسالة جديدة",
+                    f"📧 {address}",
+                    f"📧 من: {sender_raw}",
+                    f"📌 الموضوع: {subject_raw}",
+                ]
+                if date_raw:
+                    html_parts.append(f"📅 {telegram_html(date_raw)}")
+                    plain_parts.append(f"📅 {date_raw}")
                 if otp:
-                    parts.append(f"🔢 OTP: <code>{otp}</code>")
-                parts.append('')
-                parts.append(content_title)
-                parts.append(content)
+                    html_parts.append(f"🔢 OTP: <code>{telegram_html(otp)}</code>")
+                    plain_parts.append(f"🔢 OTP: {otp}")
 
-                msg_text = "\n".join(parts)
+                html_parts.extend(["", "📝 المحتوى:", telegram_html(content_raw)])
+                plain_parts.extend(["", "📝 المحتوى:", content_raw])
 
-                # نرسل HTML لكي كود OTP يظهر واضح
+                sent_successfully = False
                 try:
                     await context.bot.send_message(
                         chat_id=user_id,
-                        text=msg_text,
-                        parse_mode='HTML',
+                        text="\n".join(html_parts),
+                        parse_mode="HTML",
                         disable_web_page_preview=True,
                     )
-                except Exception:
-                    # إذا فشل HTML لأي سبب، نرسل كنص عادي
+                    sent_successfully = True
+                except Exception as html_error:
+                    print(
+                        f"⚠️ فشل إرسال HTML إلى {user_id}: "
+                        f"{type(html_error).__name__}: {html_error}"
+                    )
                     try:
                         await context.bot.send_message(
                             chat_id=user_id,
-                            text=re.sub(r'<\/?.*?>', '', msg_text),
+                            text="\n".join(plain_parts),
                             disable_web_page_preview=True,
                         )
-                    except Exception:
-                        pass
+                        sent_successfully = True
+                    except Exception as plain_error:
+                        print(
+                            f"❌ فشل إرسال البريد إلى {user_id}: "
+                            f"{type(plain_error).__name__}: {plain_error}"
+                        )
 
-                # حدث آخر رسالة مرسلة لهذا البريد
-                set_last_seen_message_id(address, mid)
+                if not sent_successfully:
+                    break
+                set_last_seen_message_id(address, message_id)
 
-            # تأكيد آخر رسالة هي الأحدث (حماية)
-            newest_id = msgs[0].get('id')
-            if newest_id:
-                set_last_seen_message_id(address, newest_id)
+# ================== النصوص العربية ==================
 
-
-# ================== نصوص (مختصر) ==================
-
-def get_text(lang, key, **kwargs):
+def get_text(_lang, key, **kwargs):
     texts = {
-        "ar": {
-            "welcome": "🎉 مرحباً بك في بوت الإيميلات المؤقتة!\n\nاختر لغتك المفضلة:",
-            "main_menu": "📬 القائمة الرئيسية\n\nعدد الإيميلات النشطة: {emails_count}",
-            "email_created": "✅ تم إنشاء بريد إلكتروني جديد!\n\n📧 الإيميل: <code>{email}</code>\n\nاضغط على الإيميل للنسخ",
-            "no_emails": "❌ لا توجد إيميلات نشطة\n\nقم بإنشاء إيميل جديد أولاً",
-            "select_email": "📋 اختر الإيميل:\n\nعدد الإيميلات: {count}",
-            "no_messages": "📭 لا توجد رسائل\n\n📧 {email}",
-            "messages_list": "📬 الرسائل الواردة ({count})\n📧 الإيميل: {email}\n\n",
-            "message_detail": "✉️ تفاصيل الرسالة\n\n📧 من: {sender}\n📌 الموضوع: {subject}\n📅 التاريخ: {date}\n\n📝 المحتوى:\n{content}\n",
-            "otp_found": "🔢 تم العثور على رمز OTP:\n\nالرمز: <code>{otp}</code>\n\nاضغط على الرمز للنسخ",
-            "email_deleted": "🗑️ تم حذف الإيميل\n\n📧 {email}",
-            "all_emails_deleted": "🗑️ تم حذف جميع الإيميلات ({count})",
-            "error_create_email": "❌ فشل إنشاء الإيميل\n\nحاول مرة أخرى.",
-            "error_load_messages": "❌ فشل تحميل الرسائل\n\nاضغط 🔄 تحديث للمحاولة.",
-            "error_load_message": "❌ فشل تحميل الرسالة\n\nحاول لاحقاً.",
-            "unauthorized": "⛔ هذا الأمر للمشرف فقط",
-            "banned": "⛔ تم حظرك من استخدام البوت.",
-            "btn_create": "✨ إنشاء إيميل جديد",
-            "btn_my_emails": "📧 إيميلاتي",
-            "btn_inbox": "📥 الرسائل الواردة",
-            "btn_delete_all": "🗑️ حذف الكل",
-            "btn_language": "🌐 تغيير اللغة",
-            "btn_back": "🔙 رجوع",
-            "btn_delete": "🗑️ حذف",
-            "btn_confirm": "✅ تأكيد",
-            "btn_cancel": "❌ إلغاء",
-            "btn_refresh": "🔄 تحديث",
-            "btn_admin_panel": "👑 لوحة المشرف",
-        },
-        "en": {
-            "welcome": "🎉 Welcome!\n\nChoose your language:",
-            "main_menu": "📬 Main Menu\n\nActive emails: {emails_count}",
-            "email_created": "✅ New email created!\n\n📧 Email: <code>{email}</code>\n\nTap to copy",
-            "no_emails": "❌ No active emails\n\nCreate one first",
-            "select_email": "📋 Select email:\n\nCount: {count}",
-            "no_messages": "📭 No messages\n\n📧 {email}",
-            "messages_list": "📬 Inbox ({count})\n📧 Email: {email}\n\n",
-            "message_detail": "✉️ Message\n\n📧 From: {sender}\n📌 Subject: {subject}\n📅 Date: {date}\n\n📝 Content:\n{content}\n",
-            "otp_found": "🔢 OTP found:\n\nCode: <code>{otp}</code>",
-            "email_deleted": "🗑️ Email deleted\n\n📧 {email}",
-            "all_emails_deleted": "🗑️ Deleted all emails ({count})",
-            "error_create_email": "❌ Failed to create email\n\nTry again.",
-            "error_load_messages": "❌ Failed to load messages\n\nPress 🔄 Refresh.",
-            "error_load_message": "❌ Failed to load message\n\nTry later.",
-            "unauthorized": "⛔ Admin only",
-            "banned": "⛔ You are banned from using this bot.",
-            "btn_create": "✨ Create New Email",
-            "btn_my_emails": "📧 My Emails",
-            "btn_inbox": "📥 Inbox",
-            "btn_delete_all": "🗑️ Delete All",
-            "btn_language": "🌐 Change Language",
-            "btn_back": "🔙 Back",
-            "btn_delete": "🗑️ Delete",
-            "btn_confirm": "✅ Confirm",
-            "btn_cancel": "❌ Cancel",
-            "btn_refresh": "🔄 Refresh",
-            "btn_admin_panel": "👑 Admin Panel",
-        }
+        "welcome": "🎉 مرحباً بك في بوت الإيميلات المؤقتة!",
+        "main_menu": "📬 القائمة الرئيسية\n\nعدد الإيميلات النشطة: {emails_count}",
+        "email_created": "✅ تم إنشاء بريد إلكتروني جديد!\n\n📧 الإيميل: <code>{email}</code>\n\nاضغط على الإيميل للنسخ",
+        "no_emails": "❌ لا توجد إيميلات نشطة\n\nقم بإنشاء إيميل جديد أولاً",
+        "select_email": "📋 اختر الإيميل:\n\nعدد الإيميلات: {count}",
+        "no_messages": "📭 لا توجد رسائل\n\n📧 {email}",
+        "messages_list": "📬 الرسائل الواردة ({count})\n📧 الإيميل: {email}\n\n",
+        "message_detail": "✉️ تفاصيل الرسالة\n\n📧 من: {sender}\n📌 الموضوع: {subject}\n📅 التاريخ: {date}\n\n📝 المحتوى:\n{content}\n",
+        "otp_found": "🔢 تم العثور على رمز OTP:\n\nالرمز: <code>{otp}</code>\n\nاضغط على الرمز للنسخ",
+        "email_deleted": "🗑️ تم حذف الإيميل\n\n📧 {email}",
+        "all_emails_deleted": "🗑️ تم حذف جميع الإيميلات ({count})",
+        "error_create_email": "❌ فشل إنشاء الإيميل\n\nحاول مرة أخرى.",
+        "error_load_messages": "❌ فشل تحميل الرسائل\n\nاضغط 🔄 تحديث للمحاولة.",
+        "error_load_message": "❌ فشل تحميل الرسالة\n\nحاول لاحقاً.",
+        "unauthorized": "⛔ هذا الأمر للمشرف فقط",
+        "banned": "⛔ تم حظرك من استخدام البوت.",
+        "btn_create": "✨ إنشاء إيميل جديد",
+        "btn_my_emails": "📧 إيميلاتي",
+        "btn_inbox": "📥 الرسائل الواردة",
+        "btn_delete_all": "🗑️ حذف الكل",
+        "btn_back": "🔙 رجوع",
+        "btn_delete": "🗑️ حذف",
+        "btn_confirm": "✅ تأكيد",
+        "btn_cancel": "❌ إلغاء",
+        "btn_refresh": "🔄 تحديث",
+        "btn_admin_panel": "👑 لوحة المشرف",
     }
-    t = texts.get(lang, texts["ar"]).get(key, "")
-    return t.format(**kwargs) if kwargs else t
+    value = texts.get(key, "")
+    return value.format(**kwargs) if kwargs else value
 
 
-# ================== Keyboards (مثل كودك + إضافة إدارة الحظر/الترحيب بالأدمن) ==================
+# ================== لوحات الأزرار ==================
 
-def get_language_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🇸🇦 العربية", callback_data="lang_ar"),
-         InlineKeyboardButton("🇬🇧 English", callback_data="lang_en")]
-    ])
-
-def get_main_menu_keyboard(lang, user_id):
+def get_main_menu_keyboard(_lang, user_id):
     keyboard = [
-        [InlineKeyboardButton(get_text(lang, "btn_create"), callback_data="create_email")],
+        [InlineKeyboardButton(get_text("ar", "btn_create"), callback_data="create_email", style="success")],
         [
-            InlineKeyboardButton(get_text(lang, "btn_my_emails"), callback_data="my_emails"),
-            InlineKeyboardButton(get_text(lang, "btn_inbox"), callback_data="select_inbox"),
+            InlineKeyboardButton(get_text("ar", "btn_my_emails"), callback_data="my_emails", style="primary"),
+            InlineKeyboardButton(get_text("ar", "btn_inbox"), callback_data="select_inbox", style="primary"),
         ],
-        [InlineKeyboardButton(get_text(lang, "btn_delete_all"), callback_data="confirm_delete_all")],
-        [InlineKeyboardButton(get_text(lang, "btn_language"), callback_data="change_language")],
+        [InlineKeyboardButton(get_text("ar", "btn_delete_all"), callback_data="confirm_delete_all", style="danger")],
     ]
     if is_admin(user_id):
-        keyboard.insert(3, [InlineKeyboardButton(get_text(lang, "btn_admin_panel"), callback_data="admin_panel")])
+        keyboard.append([
+            InlineKeyboardButton(get_text("ar", "btn_admin_panel"), callback_data="admin_panel", style="primary")
+        ])
     return InlineKeyboardMarkup(keyboard)
 
-def get_email_list_keyboard(emails, action_prefix, lang):
+
+def get_email_list_keyboard(emails, action_prefix, _lang):
     keyboard = []
-    for i, e in enumerate(emails):
-        email = e["address"]
+    for index, email_info in enumerate(emails):
+        email = email_info["address"]
         display_email = email if len(email) <= 30 else email[:27] + "..."
-        keyboard.append([InlineKeyboardButton(f"📧 {display_email}", callback_data=f"{action_prefix}_{i}")])
-    keyboard.append([InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="back_to_menu")])
+        keyboard.append([
+            InlineKeyboardButton(
+                f"📧 {display_email}",
+                callback_data=f"{action_prefix}_{index}",
+                style="primary",
+            )
+        ])
+    keyboard.append([InlineKeyboardButton(get_text("ar", "btn_back"), callback_data="back_to_menu")])
     return InlineKeyboardMarkup(keyboard)
 
-def get_messages_keyboard(messages, email_index, lang):
+
+def get_messages_keyboard(messages, email_index, _lang):
     keyboard = []
-    for i, msg in enumerate(messages[:10]):
-        subject = msg.get("subject", "No Subject")
+    for index, message in enumerate(messages[:10]):
+        subject = message.get("subject") or "بدون موضوع"
         display_subject = subject if len(subject) <= 30 else subject[:27] + "..."
-        keyboard.append([InlineKeyboardButton(f"✉️ {display_subject}", callback_data=f"msg_{email_index}_{i}")])
+        keyboard.append([
+            InlineKeyboardButton(
+                f"✉️ {display_subject}",
+                callback_data=f"msg_{email_index}_{index}",
+                style="primary",
+            )
+        ])
     keyboard.append([
-        InlineKeyboardButton(get_text(lang, "btn_refresh"), callback_data=f"inbox_{email_index}"),
-        InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="select_inbox"),
+        InlineKeyboardButton(get_text("ar", "btn_refresh"), callback_data=f"inbox_{email_index}", style="success"),
+        InlineKeyboardButton(get_text("ar", "btn_back"), callback_data="select_inbox"),
     ])
     return InlineKeyboardMarkup(keyboard)
 
-def get_admin_panel_keyboard(lang, user_id):
-    # نفس أزرارك القديمة + أزرار جديدة (من غير حذف القديم)
+
+def get_admin_panel_keyboard(_lang, user_id):
     keyboard = [
-        [InlineKeyboardButton("📊 قسم الإحصائيات" if lang=="ar" else "📊 Statistics", callback_data="section_stats")],
-        [InlineKeyboardButton("📢 قسم الإذاعة" if lang=="ar" else "📢 Broadcasting", callback_data="section_broadcast")],
-        [InlineKeyboardButton("📨 قسم توجيه الرسائل" if lang=="ar" else "📨 Message Forwarding", callback_data="section_forward")],
-        [InlineKeyboardButton("📢 إدارة القنوات" if lang=="ar" else "📢 Channel Management", callback_data="channel_management")],
-        [InlineKeyboardButton("⚙️ الإعدادات" if lang=="ar" else "⚙️ Settings", callback_data="section_settings")],
-        [InlineKeyboardButton("👥 إدارة الأعضاء" if lang=="ar" else "👥 Member Management", callback_data="section_members")],
+        [InlineKeyboardButton("📊 قسم الإحصائيات", callback_data="section_stats", style="primary")],
+        [InlineKeyboardButton("📢 قسم الإذاعة", callback_data="section_broadcast", style="primary")],
+        [InlineKeyboardButton("📨 قسم توجيه الرسائل", callback_data="section_forward", style="primary")],
+        [InlineKeyboardButton("📢 إدارة القنوات", callback_data="channel_management", style="primary")],
+        [InlineKeyboardButton("⚙️ الإعدادات", callback_data="section_settings", style="primary")],
+        [InlineKeyboardButton("👥 إدارة الأعضاء", callback_data="section_members", style="primary")],
+        [InlineKeyboardButton("🔢 حد إنشاء الإيميلات", callback_data="section_email_limit", style="primary")],
     ]
     if user_id == ADMIN_ID:
-        keyboard.append([InlineKeyboardButton("👮 إدارة المشرفين" if lang=="ar" else "👮 Admin Management", callback_data="section_admins")])
+        keyboard.append([InlineKeyboardButton("👮 إدارة المشرفين", callback_data="section_admins", style="primary")])
 
-    # ✅ إضافاتك الجديدة للأدمن
-    keyboard.append([InlineKeyboardButton("🛑 الحظر / فك الحظر" if lang=="ar" else "🛑 Ban / Unban", callback_data="section_ban")])
-    keyboard.append([InlineKeyboardButton("👋 رسالة الترحيب" if lang=="ar" else "👋 Welcome Message", callback_data="section_welcome")])
-
-    keyboard.append([InlineKeyboardButton("ℹ️ معلومات البوت" if lang=="ar" else "ℹ️ Bot Info", callback_data="bot_info")])
-    keyboard.append([InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="back_to_menu")])
+    keyboard.extend([
+        [InlineKeyboardButton("🛑 الحظر / فك الحظر", callback_data="section_ban", style="danger")],
+        [InlineKeyboardButton("👋 رسالة الترحيب", callback_data="section_welcome", style="success")],
+        [InlineKeyboardButton("ℹ️ معلومات البوت", callback_data="bot_info")],
+        [InlineKeyboardButton(get_text("ar", "btn_back"), callback_data="back_to_menu")],
+    ])
     return InlineKeyboardMarkup(keyboard)
 
-def get_channel_management_keyboard(lang):
+
+def get_channel_management_keyboard(_lang):
     channel_info = get_channel_info(only_enabled=False)
     keyboard = [
-        [InlineKeyboardButton("تعيين القناة" if lang=="ar" else "Set Channel", callback_data="set_channel")],
-        [InlineKeyboardButton("تعيين رسالة الاشتراك" if lang=="ar" else "Set Subscription Message", callback_data="set_channel_message")],
+        [InlineKeyboardButton("تعيين القناة", callback_data="set_channel", style="primary")],
+        [InlineKeyboardButton("تعيين رسالة الاشتراك", callback_data="set_channel_message", style="primary")],
     ]
     if channel_info:
         status_icon = "✅" if channel_info.get("subscription_enabled") else "❌"
-        keyboard.append([InlineKeyboardButton(f"إشعار الاشتراك: {status_icon}" if lang=="ar" else f"Subscription: {status_icon}",
-                                             callback_data="toggle_subscription")])
-        keyboard.append([InlineKeyboardButton("حذف القناة" if lang=="ar" else "Delete Channel", callback_data="delete_channel")])
-    keyboard.append([InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="admin_panel")])
+        keyboard.append([
+            InlineKeyboardButton(
+                f"إشعار الاشتراك: {status_icon}",
+                callback_data="toggle_subscription",
+                style="success" if channel_info.get("subscription_enabled") else "danger",
+            )
+        ])
+        keyboard.append([
+            InlineKeyboardButton("حذف القناة", callback_data="delete_channel", style="danger")
+        ])
+    keyboard.append([InlineKeyboardButton(get_text("ar", "btn_back"), callback_data="admin_panel")])
     return InlineKeyboardMarkup(keyboard)
-
 
 # ================== أدوات منع/سماح (جديد) ==================
 
@@ -1044,42 +1182,35 @@ async def guard_user(update_or_query, context, user_id: int, lang: str) -> bool:
 # ================== أوامر ==================
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
     user = update.effective_user
+    message = update.effective_message
+    if user is None or message is None:
+        return
 
+    user_id = user.id
     update_user_info(user_id, user)
-    lang = get_user_language(user_id) or "ar"
+    lang = "ar"
 
-    # حارس منع
     if not await guard_user(update, context, user_id, lang):
         return
 
-    saved_lang = get_user_language(user_id)
-
-    if not saved_lang:
-        await update.message.reply_text(get_text("ar", "welcome"), reply_markup=get_language_keyboard())
-        return
-
-    # ✅ رسالة ترحيب مخصصة (جديد)
-    welcome_msg = get_setting("welcome_message", "")
-    if welcome_msg and not is_admin(user_id):
-        try:
-            await update.message.reply_text(welcome_msg)
-        except:
-            pass
-
-    emails_count = len(get_user_emails(user_id))
-    text = get_text(lang, "main_menu", emails_count=emails_count)
-    await update.message.reply_text(text, reply_markup=get_main_menu_keyboard(lang, user_id))
+    await message.reply_text(
+        build_main_menu_text(user_id),
+        reply_markup=get_main_menu_keyboard(lang, user_id),
+    )
 
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text(get_text("ar", "unauthorized"))
+    user = update.effective_user
+    message = update.effective_message
+    if user is None or message is None:
         return
-    lang = get_user_language(user_id) or "ar"
-    await update.message.reply_text("👑 لوحة المشرف", reply_markup=get_admin_panel_keyboard(lang, user_id))
+
+    user_id = user.id
+    if not is_admin(user_id):
+        await message.reply_text(get_text("ar", "unauthorized"))
+        return
+    await message.reply_text("👑 لوحة المشرف", reply_markup=get_admin_panel_keyboard("ar", user_id))
 
 
 # ================== الأزرار ==================
@@ -1088,55 +1219,62 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global forwarding_enabled, bot_active, bot_offline_message
 
     query = update.callback_query
+    user = update.effective_user
+    if query is None or user is None:
+        return
+
     try:
         await query.answer()
-    except:
+    except Exception:
         pass
 
-    user_id = update.effective_user.id
-    data = query.data
-    lang = get_user_language(user_id) or "ar"
+    user_id = user.id
+    data = query.data or ""
+    lang = "ar"
 
-    # حارس منع (ينطبق على كل شيء لغير الأدمن)
     if not await guard_user(query, context, user_id, lang):
-        return
-
-    # اختيار اللغة
-    if data.startswith("lang_"):
-        chosen = data.split("_")[1]
-        set_user_language(user_id, chosen, update.effective_user)
-
-        emails_count = len(get_user_emails(user_id))
-        text = get_text(chosen, "main_menu", emails_count=emails_count)
-        await query.edit_message_text(text, reply_markup=get_main_menu_keyboard(chosen, user_id))
-        return
-
-    # تغيير اللغة
-    if data == "change_language":
-        await query.edit_message_text(get_text("ar", "welcome"), reply_markup=get_language_keyboard())
         return
 
     # رجوع للقائمة
     if data == "back_to_menu":
-        emails_count = len(get_user_emails(user_id))
-        text = get_text(lang, "main_menu", emails_count=emails_count)
-        await query.edit_message_text(text, reply_markup=get_main_menu_keyboard(lang, user_id))
+        await query.edit_message_text(
+            build_main_menu_text(user_id),
+            reply_markup=get_main_menu_keyboard(lang, user_id),
+        )
         return
 
     # إنشاء إيميل
     if data == "create_email":
-        email, token = create_email()
+        current_count = len(get_user_emails(user_id))
+        email_limit = get_email_limit()
+        if (not is_admin(user_id)) and email_limit > 0 and current_count >= email_limit:
+            await query.edit_message_text(
+                "⚠️ لقد وصلت إلى الحد المسموح لإنشاء الإيميلات.\n\n"
+                "يرجى التواصل مع الأدمن لإنشاء المزيد من الإيميلات.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="back_to_menu")
+                ]]),
+            )
+            return
+
+        email, token = await asyncio.to_thread(create_email)
         if email and token:
             add_user_email(user_id, email, token)
-            await query.edit_message_text(get_text(lang, "email_created", email=email),
-                                          reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="back_to_menu")]]),
-                                          parse_mode="HTML")
+            await query.edit_message_text(
+                get_text(lang, "email_created", email=telegram_html(email)),
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="back_to_menu")
+                ]]),
+                parse_mode="HTML",
+            )
         else:
-            await query.edit_message_text(get_text(lang, "error_create_email"),
-                                          reply_markup=InlineKeyboardMarkup([
-                                              [InlineKeyboardButton(get_text(lang, "btn_create"), callback_data="create_email")],
-                                              [InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="back_to_menu")]
-                                          ]))
+            await query.edit_message_text(
+                get_text(lang, "error_create_email"),
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(get_text(lang, "btn_create"), callback_data="create_email", style="success")],
+                    [InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="back_to_menu")],
+                ]),
+            )
         return
 
     # إيميلاتي
@@ -1171,7 +1309,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if email_index >= len(emails):
             return
         email_data = emails[email_index]
-        messages = check_inbox(email_data["token"])
+        messages = await asyncio.to_thread(check_inbox, email_data["token"])
 
         if messages is None:
             await query.edit_message_text(get_text(lang, "error_load_messages"),
@@ -1205,30 +1343,38 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         email_data = emails[email_index]
 
-        messages = check_inbox(email_data["token"])
+        messages = await asyncio.to_thread(check_inbox, email_data["token"])
         if not messages or msg_index >= len(messages):
             return
         msg_id = messages[msg_index]["id"]
 
-        full = get_message_content(msg_id, email_data["token"])
+        full = await asyncio.to_thread(get_message_content, msg_id, email_data["token"])
         if not full:
             await query.edit_message_text(get_text(lang, "error_load_message"),
                                           reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data=f"inbox_{email_index}")]]))
             return
 
-        sender = full.get("from", {}).get("address", "Unknown")
-        subject = full.get("subject", "No Subject")
-        date = full.get("createdAt", "Unknown")
-        content = get_message_text(full)
+        sender_raw = (full.get("from") or {}).get("address") or "غير معروف"
+        subject_raw = full.get("subject") or "بدون موضوع"
+        date_raw = full.get("createdAt") or "غير معروف"
+        content_raw = get_message_text(full)
 
-        otp = extract_otp(content)
-        content = content[:3500] + ("\n\n... (الرسالة طويلة جداً)" if lang=="ar" else "\n\n... (too long)") if len(content) > 3500 else content
+        otp = extract_otp(content_raw)
+        if len(content_raw) > 3500:
+            content_raw = content_raw[:3500] + "\n\n... (الرسالة طويلة جداً)"
 
+        safe_values = {
+            "sender": telegram_html(sender_raw),
+            "subject": telegram_html(subject_raw),
+            "date": telegram_html(date_raw),
+            "content": telegram_html(content_raw),
+        }
         if otp:
-            text = get_text(lang, "otp_found", otp=otp) + "\n\n" + get_text(lang, "message_detail",
-                                                                           sender=sender, subject=subject, date=date, content=content)
+            text = get_text(lang, "otp_found", otp=telegram_html(otp)) + "\n\n" + get_text(
+                lang, "message_detail", **safe_values
+            )
         else:
-            text = get_text(lang, "message_detail", sender=sender, subject=subject, date=date, content=content)
+            text = get_text(lang, "message_detail", **safe_values)
 
         await query.edit_message_text(text,
                                       reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data=f"inbox_{email_index}")]]),
@@ -1247,8 +1393,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         email_data = emails[email_index]
         text = f"📧 <code>{email_data['address']}</code>\n🔑 <code>TempMail123</code>"
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(get_text(lang, "btn_inbox"), callback_data=f"inbox_{email_index}")],
-            [InlineKeyboardButton(get_text(lang, "btn_delete"), callback_data=f"confirm_delete_{email_index}")],
+            [InlineKeyboardButton(get_text(lang, "btn_inbox"), callback_data=f"inbox_{email_index}", style="primary")],
+            [InlineKeyboardButton(get_text(lang, "btn_delete"), callback_data=f"confirm_delete_{email_index}", style="danger")],
             [InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="my_emails")]
         ])
         await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
@@ -1266,7 +1412,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         email_data = emails[email_index]
         text = f"⚠️ هل أنت متأكد من حذف هذا الإيميل؟\n\n📧 {email_data['address']}"
         kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton(get_text(lang, "btn_confirm"), callback_data=f"delete_{email_index}"),
+            InlineKeyboardButton(get_text(lang, "btn_confirm"), callback_data=f"delete_{email_index}", style="danger"),
             InlineKeyboardButton(get_text(lang, "btn_cancel"), callback_data="my_emails")
         ]])
         await query.edit_message_text(text, reply_markup=kb)
@@ -1295,29 +1441,30 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         text = f"⚠️ هل أنت متأكد من حذف جميع الإيميلات؟\n\nالعدد: {len(emails)}"
         kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton(get_text(lang, "btn_confirm"), callback_data="delete_all"),
+            InlineKeyboardButton(get_text(lang, "btn_confirm"), callback_data="delete_all", style="danger"),
             InlineKeyboardButton(get_text(lang, "btn_cancel"), callback_data="back_to_menu")
         ]])
         await query.edit_message_text(text, reply_markup=kb)
         return
 
     if data == "delete_all":
-        emails = get_user_emails(user_id)
-        count = len(emails)
-        user_database[str(user_id)]["emails"] = []
-        save_single_user(str(user_id), user_database[str(user_id)])
-        await query.edit_message_text(get_text(lang, "all_emails_deleted", count=count),
-                                      reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="back_to_menu")]]))
+        success, count = clear_user_emails(user_id)
+        text = get_text(lang, "all_emails_deleted", count=count) if success else "❌ فشل حذف الإيميلات"
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="back_to_menu")
+            ]]),
+        )
         return
 
     # ✅ تحقق الاشتراك (زر)
     if data == "verify_subscription":
         ok = await check_user_subscription_strict(user_id, context)
         if ok:
-            emails_count = len(get_user_emails(user_id))
-            text = "✅ تم التحقق من اشتراكك بنجاح!\n\n" + get_text(lang, "main_menu", emails_count=emails_count) if lang=="ar" else \
-                   "✅ Subscription verified!\n\n" + get_text(lang, "main_menu", emails_count=emails_count)
+            text = "✅ تم التحقق من اشتراكك بنجاح!\n\n" + build_main_menu_text(user_id)
             await query.edit_message_text(text, reply_markup=get_main_menu_keyboard(lang, user_id))
+
         else:
             ch = get_channel_info()
             if ch:
@@ -1350,8 +1497,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "📢 معلومات القناة الحالية\n\n"
                 f"القناة: @{channel_info['channel_username']}\n"
                 f"الحالة: {status}\n"
-                f"الرسالة: {msg}\n"
-                f"📢 اسم القناة: <b>{title}</b>\n"
+                f"الرسالة: {telegram_html(msg)}\n"
+                f"📢 اسم القناة: <b>{telegram_html(title)}</b>\n"
                 f"🆔 معرّف القناة: <code>{cid}</code>"
             )
         else:
@@ -1426,8 +1573,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status = "✅ مفعّل" if forwarding_enabled else "❌ معطّل"
         text = f"📨 قسم توجيه الرسائل\n\nالحالة: {status}\n\nعند التفعيل، أي رسالة يرسلها المستخدمون ستصلك مباشرة."
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ تفعيل التوجيه", callback_data="forward_on")],
-            [InlineKeyboardButton("❌ تعطيل التوجيه", callback_data="forward_off")],
+            [InlineKeyboardButton("✅ تفعيل التوجيه", callback_data="forward_on", style="success")],
+            [InlineKeyboardButton("❌ تعطيل التوجيه", callback_data="forward_off", style="danger")],
             [InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="admin_panel")]
         ])
         await query.edit_message_text(text, reply_markup=kb)
@@ -1485,8 +1632,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(user_id):
             return
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📨 إذاعة للكل", callback_data="broadcast_all")],
-            [InlineKeyboardButton("👥 إذاعة للنشطين فقط", callback_data="broadcast_active")],
+            [InlineKeyboardButton("📨 إذاعة للكل", callback_data="broadcast_all", style="primary")],
+            [InlineKeyboardButton("👥 إذاعة للنشطين فقط", callback_data="broadcast_active", style="primary")],
             [InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="admin_panel")]
         ])
         await query.edit_message_text("📢 قسم الإذاعة\n\nاختر نوع الإذاعة:", reply_markup=kb)
@@ -1509,6 +1656,46 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                       reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_broadcast")]]))
         return
 
+    if data == "section_email_limit":
+        if not is_admin(user_id):
+            return
+        limit = get_email_limit()
+        current = "غير محدود" if limit == 0 else str(limit)
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✏️ تحديد العدد", callback_data="set_email_limit", style="primary")],
+            [InlineKeyboardButton("♾️ إلغاء الحد", callback_data="clear_email_limit", style="danger")],
+            [InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="admin_panel")],
+        ])
+        await query.edit_message_text(
+            f"🔢 حد إنشاء الإيميلات\n\nالحد الحالي لكل مستخدم: {current}",
+            reply_markup=keyboard,
+        )
+        return
+
+    if data == "set_email_limit":
+        if not is_admin(user_id):
+            return
+        context.user_data["waiting_for"] = "email_limit"
+        await query.edit_message_text(
+            "🔢 أرسل العدد الأقصى الذي يستطيع كل مستخدم إنشاءه.\n\nمثال: 3",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_email_limit")
+            ]]),
+        )
+        return
+
+    if data == "clear_email_limit":
+        if not is_admin(user_id):
+            return
+        set_setting("email_limit", "0")
+        await query.edit_message_text(
+            "✅ تم إلغاء الحد وأصبح إنشاء الإيميلات غير محدود.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_email_limit")
+            ]]),
+        )
+        return
+
     if data == "section_members":
         if not is_admin(user_id):
             return
@@ -1523,13 +1710,22 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• الأعضاء غير النشطين: {inactive_users}\n"
             f"• إجمالي الإيميلات: {total_emails}\n"
         )
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📋 قائمة كل الأعضاء", callback_data="users_list_all")],
-            [InlineKeyboardButton("✅ الأعضاء النشطين", callback_data="users_list_active")],
-            [InlineKeyboardButton("🏆 الأكثر إيميلات", callback_data="users_list_top")],
-            [InlineKeyboardButton("🔍 بحث عن عضو", callback_data="search_member")],
-            [InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="admin_panel")]
-        ])
+        member_buttons = [
+            [InlineKeyboardButton("📋 قائمة كل الأعضاء", callback_data="users_list_all", style="primary")],
+            [InlineKeyboardButton("✅ الأعضاء النشطين", callback_data="users_list_active", style="success")],
+            [InlineKeyboardButton("🏆 الأكثر إيميلات", callback_data="users_list_top", style="primary")],
+            [InlineKeyboardButton("🔍 بحث عن عضو", callback_data="search_member", style="primary")],
+        ]
+        if user_id == ADMIN_ID:
+            member_buttons.append([
+                InlineKeyboardButton(
+                    "🗑️ حذف إيميلات عضو",
+                    callback_data="delete_user_emails",
+                    style="danger",
+                )
+            ])
+        member_buttons.append([InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="admin_panel")])
+        kb = InlineKeyboardMarkup(member_buttons)
         await query.edit_message_text(text, reply_markup=kb)
         return
 
@@ -1544,7 +1740,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             username = f"@{info.get('username')}" if info.get("username") else "—"
             emails_count = len(info.get("emails", []))
             status = "✅" if emails_count > 0 else "⚪"
-            text += f"{count}. {status} <b>{name}</b>\n    🆔 {username} | 📧 {emails_count}\n    ID: <code>{uid}</code>\n\n"
+            text += f"{count}. {status} <b>{telegram_html(name)}</b>\n    🆔 {telegram_html(username)} | 📧 {emails_count}\n    ID: <code>{uid}</code>\n\n"
         await query.edit_message_text(text, parse_mode="HTML",
                                       reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_members")]]))
         return
@@ -1560,7 +1756,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             name = (info.get("first_name") or "مجهول") + (f" {info.get('last_name')}" if info.get("last_name") else "")
             username = f"@{info.get('username')}" if info.get("username") else "—"
             emails_count = len(info.get("emails", []))
-            text += f"{count}. <b>{name}</b>\n    🆔 {username} | 📧 {emails_count}\n    ID: <code>{uid}</code>\n\n"
+            text += f"{count}. <b>{telegram_html(name)}</b>\n    🆔 {telegram_html(username)} | 📧 {emails_count}\n    ID: <code>{uid}</code>\n\n"
         await query.edit_message_text(text, parse_mode="HTML",
                                       reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_members")]]))
         return
@@ -1580,7 +1776,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             medal = medals[rank-1] if rank <= 3 else f"{rank}."
             name = (info.get("first_name") or "مجهول") + (f" {info.get('last_name')}" if info.get("last_name") else "")
             username = f"@{info.get('username')}" if info.get("username") else "—"
-            text += f"{medal} <b>{name}</b>\n    🆔 {username}\n    📧 {emails_count}\n    ID: <code>{uid}</code>\n\n"
+            text += f"{medal} <b>{telegram_html(name)}</b>\n    🆔 {telegram_html(username)}\n    📧 {emails_count}\n    ID: <code>{uid}</code>\n\n"
         await query.edit_message_text(text, parse_mode="HTML",
                                       reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_members")]]))
         return
@@ -1591,6 +1787,40 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["waiting_for"] = "search_member"
         await query.edit_message_text("🔍 أرسل ID أو username أو اسم للبحث:",
                                       reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_members")]]))
+        return
+
+    if data == "delete_user_emails":
+        if user_id != ADMIN_ID:
+            await query.answer("هذا الخيار للمشرف الرئيسي فقط.", show_alert=True)
+            return
+        context.user_data["waiting_for"] = "delete_user_emails"
+        await query.edit_message_text(
+            "🗑️ أرسل ID العضو أو @username لحذف جميع إيميلاته من بيانات البوت.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_members")
+            ]]),
+        )
+        return
+
+    if data.startswith("confirm_delete_user_emails_"):
+        if user_id != ADMIN_ID:
+            return
+        target_value = data.replace("confirm_delete_user_emails_", "", 1)
+        if not target_value.isdigit():
+            return
+        target_id = int(target_value)
+        success, deleted_count = clear_user_emails(target_id)
+        context.user_data.pop("delete_user_emails_target", None)
+        if success:
+            result_text = f"✅ تم حذف {deleted_count} إيميل من بيانات العضو."
+        else:
+            result_text = "❌ فشل حذف إيميلات العضو."
+        await query.edit_message_text(
+            result_text,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_members")
+            ]]),
+        )
         return
 
     # ================== إدارة المشرفين (للرئيسي فقط) ==================
@@ -1609,13 +1839,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for a in admins:
                 name = a.get("first_name") or "مجهول"
                 username = f"@{a.get('username')}" if a.get("username") else "—"
-                text += f"• {name} | {username}\n  ID: <code>{a['telegram_id']}</code>\n"
+                text += f"• {telegram_html(name)} | {telegram_html(username)}\n  ID: <code>{a['telegram_id']}</code>\n"
         else:
             text += "لا يوجد مشرفون إضافيون حالياً\n"
 
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ إضافة مشرف", callback_data="add_admin")],
-            [InlineKeyboardButton("➖ إزالة مشرف", callback_data="remove_admin")],
+            [InlineKeyboardButton("➕ إضافة مشرف", callback_data="add_admin", style="success")],
+            [InlineKeyboardButton("➖ إزالة مشرف", callback_data="remove_admin", style="danger")],
             [InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="admin_panel")]
         ])
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
@@ -1640,7 +1870,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb_rows = []
         for a in admins:
             name = a.get("first_name") or str(a["telegram_id"])
-            kb_rows.append([InlineKeyboardButton(f"❌ {name}", callback_data=f"confirm_remove_admin_{a['telegram_id']}")])
+            kb_rows.append([InlineKeyboardButton(f"❌ {name}", callback_data=f"confirm_remove_admin_{a['telegram_id']}", style="danger")])
         kb_rows.append([InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_admins")])
         await query.edit_message_text("➖ اختر المشرف لإزالته:", reply_markup=InlineKeyboardMarkup(kb_rows))
         return
@@ -1662,8 +1892,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(user_id):
             return
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🛑 حظر مستخدم", callback_data="ban_user")],
-            [InlineKeyboardButton("✅ فك حظر مستخدم", callback_data="unban_user")],
+            [InlineKeyboardButton("🛑 حظر مستخدم", callback_data="ban_user", style="danger")],
+            [InlineKeyboardButton("✅ فك حظر مستخدم", callback_data="unban_user", style="success")],
             [InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="admin_panel")]
         ])
         await query.edit_message_text("🛑 قسم الحظر\n\nاختر:", reply_markup=kb)
@@ -1690,8 +1920,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         current = get_setting("welcome_message", "")
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✏️ تعيين رسالة الترحيب", callback_data="set_welcome_message")],
-            [InlineKeyboardButton("🧹 حذف رسالة الترحيب", callback_data="clear_welcome_message")],
+            [InlineKeyboardButton("✏️ تعيين رسالة الترحيب", callback_data="set_welcome_message", style="success")],
+            [InlineKeyboardButton("🧹 حذف رسالة الترحيب", callback_data="clear_welcome_message", style="danger")],
             [InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="admin_panel")]
         ])
         text = "👋 رسالة الترحيب الحالية:\n\n"
@@ -1703,7 +1933,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(user_id):
             return
         context.user_data["waiting_for"] = "welcome_message"
-        await query.edit_message_text("✏️ أرسل رسالة الترحيب الجديدة التي ستظهر عند /start (لغير المشرفين):",
+        await query.edit_message_text("✏️ أرسل رسالة الترحيب الجديدة. ستظهر مدمجة أعلى القائمة الرئيسية وعدد الإيميلات:",
                                       reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_welcome")]]))
         return
 
@@ -1719,7 +1949,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(user_id):
             await query.answer(get_text(lang, "unauthorized"), show_alert=True)
             return
-        text = "ℹ️ معلومات البوت\n\n🤖 Name: Temp Email Bot\n📌 Version: 2.1\n📧 API: mail.tm\n✅ Added: Strict Sub + Welcome + Ban"
+        text = "ℹ️ معلومات البوت\n\n🤖 الاسم: بوت الإيميلات المؤقتة\n📌 الإصدار: 3.0\n📧 الخدمة: mail.tm\n✅ الواجهة: العربية"
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="admin_panel")]]))
         return
 
@@ -1729,11 +1959,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global forwarding_enabled, bot_offline_message
 
-    user_id = update.effective_user.id
     user = update.effective_user
-    update_user_info(user_id, user)
+    message = update.effective_message
+    if user is None or message is None:
+        return
 
-    lang = get_user_language(user_id) or "ar"
+    user_id = user.id
+    update_user_info(user_id, user)
+    lang = "ar"
 
     # حارس منع
     if not await guard_user(update, context, user_id, lang):
@@ -1748,11 +1981,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             username = f"@{user.username}" if user.username else "لا يوجد"
             forward_text = (
                 "📨 <b>رسالة جديدة من مستخدم:</b>\n\n"
-                f"👤 الاسم: {user_name}\n"
-                f"🆔 المعرف: {username}\n"
+                f"👤 الاسم: {telegram_html(user_name)}\n"
+                f"🆔 المعرف: {telegram_html(username)}\n"
                 f"🔢 ID: <code>{user_id}</code>\n"
                 f"━━━━━━━━━━━━━━━\n"
-                f"💬 الرسالة:\n{update.message.text}"
+                f"💬 الرسالة:\n{telegram_html(message.text)}"
             )
             await context.bot.send_message(chat_id=ADMIN_ID, text=forward_text, parse_mode="HTML")
         except Exception as e:
@@ -1837,6 +2070,67 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_broadcast")]]))
         return
 
+    # تحديد الحد العام لإنشاء الإيميلات
+    if waiting_for == "email_limit" and is_admin(user_id):
+        raw_limit = (message.text or "").strip()
+        if not raw_limit.isdigit() or not (1 <= int(raw_limit) <= 100):
+            await message.reply_text(
+                "❌ أرسل رقماً صحيحاً من 1 إلى 100.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_email_limit")
+                ]]),
+            )
+            return
+
+        set_setting("email_limit", raw_limit)
+        context.user_data["waiting_for"] = None
+        await message.reply_text(
+            f"✅ تم تحديد الحد إلى {raw_limit} إيميل لكل مستخدم.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_email_limit")
+            ]]),
+        )
+        return
+
+    # اختيار عضو لحذف إيميلاته - للمشرف الرئيسي فقط
+    if waiting_for == "delete_user_emails" and user_id == ADMIN_ID:
+        found = find_user_by_username_or_id(message.text or "")
+        if not found:
+            await message.reply_text(
+                "❌ لم يتم العثور على العضو. أرسل ID صحيحاً أو @username.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_members")
+                ]]),
+            )
+            return
+
+        target_id, target_info = found
+        context.user_data["waiting_for"] = None
+        context.user_data["delete_user_emails_target"] = target_id
+        name = (target_info.get("first_name") or "مجهول")
+        if target_info.get("last_name"):
+            name += f" {target_info['last_name']}"
+        username = f"@{target_info.get('username')}" if target_info.get("username") else "—"
+        count = len(target_info.get("emails") or [])
+        confirm_text = (
+            "⚠️ تأكيد حذف إيميلات العضو\n\n"
+            f"👤 الاسم: {name}\n"
+            f"🆔 المستخدم: {username}\n"
+            f"🔢 ID: {target_id}\n"
+            f"📧 عدد الإيميلات: {count}\n\n"
+            "سيتم حذف الإيميلات من بيانات البوت فقط، ولن يُحذف حساب العضو."
+        )
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "🗑️ تأكيد الحذف",
+                callback_data=f"confirm_delete_user_emails_{target_id}",
+                style="danger",
+            ),
+            InlineKeyboardButton("❌ إلغاء", callback_data="section_members"),
+        ]])
+        await message.reply_text(confirm_text, reply_markup=keyboard)
+        return
+
     # بحث عضو
     if waiting_for == "search_member" and is_admin(user_id):
         q = (update.message.text or "").strip().lower()
@@ -1860,13 +2154,13 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_members")]]))
             return
 
-        text = f"🔍 نتائج البحث عن '{q}':\n━━━━━━━━━━━━━━━\n\n"
+        text = f"🔍 نتائج البحث عن '{telegram_html(q)}':\n━━━━━━━━━━━━━━━\n\n"
         for uid, info in results[:10]:
             name = (info.get("first_name") or "مجهول") + (f" {info.get('last_name')}" if info.get("last_name") else "")
             username = f"@{info.get('username')}" if info.get("username") else "—"
             emails_count = len(info.get("emails", []))
             status = "✅ نشط" if emails_count > 0 else "⚪ غير نشط"
-            text += f"👤 <b>{name}</b>\n🆔 {username}\n📧 {emails_count} | {status}\n🔢 ID: <code>{uid}</code>\n\n"
+            text += f"👤 <b>{telegram_html(name)}</b>\n🆔 {telegram_html(username)}\n📧 {emails_count} | {status}\n🔢 ID: <code>{uid}</code>\n\n"
 
         await update.message.reply_text(text, parse_mode="HTML",
                                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_members")]]))
@@ -1913,14 +2207,17 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
-# ================== Error Handler ==================
+# ================== معالج الأخطاء ==================
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    err = str(context.error)
-    ignorable = ["Query is too old", "query id is invalid", "Message is not modified"]
-    if any(x in err for x in ignorable):
+    error = context.error
+    error_text = str(error)
+    ignorable = ("Query is too old", "query id is invalid", "Message is not modified")
+    if any(item in error_text for item in ignorable):
         return
-    print(f"❌ ERROR: {context.error}")
+
+    print(f"❌ ERROR {type(error).__name__}: {error}")
+    traceback.print_exception(type(error), error, error.__traceback__)
 
 
 # ================== تشغيل ==================
@@ -1928,30 +2225,36 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
-        print("❌ ضع TELEGRAM_BOT_TOKEN بمتغيرات البيئة")
+        print("❌ ضع TELEGRAM_BOT_TOKEN في متغيرات Railway")
         return
 
     application = Application.builder().token(token).build()
-
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("admin", admin_command))
     application.add_handler(CallbackQueryHandler(button_callback))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
-
+    application.add_handler(MessageHandler(
+        filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
+        message_handler,
+    ))
     application.add_error_handler(error_handler)
 
-    # ✅ جديد: فحص تلقائي لصندوق الوارد (mail.tm) وإرسال الرسائل فور وصولها
     try:
         if application.job_queue:
-            application.job_queue.run_repeating(poll_inboxes_job, interval=20, first=10, name="poll_inboxes")
-            print("✅ Auto inbox polling enabled (every 20s)")
+            application.job_queue.run_repeating(
+                poll_inboxes_job,
+                interval=20,
+                first=10,
+                name="poll_inboxes",
+            )
+            print("✅ فحص صندوق الوارد التلقائي مفعّل كل 20 ثانية")
         else:
             print("⚠️ JobQueue غير متاح - لن يعمل الفحص التلقائي")
-    except Exception as e:
-        print(f"⚠️ Failed to start polling job: {e}")
+    except Exception as error:
+        print(f"⚠️ فشل تشغيل مهمة فحص البريد: {error}")
 
-    print("🤖 Bot is running (polling)...")
+    print("🤖 البوت يعمل الآن...")
     application.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
