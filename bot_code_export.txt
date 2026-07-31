@@ -1,14 +1,14 @@
 ================================================================================
-                  بوت الإيميلات المؤقتة - نسخة Railway النهائية
+      بوت الإيميلات المؤقتة - تحديث الدومينات ورسائل أخطاء البريد
 ================================================================================
 
-هذا الملف للتصدير والمراجعة. ارفع الملفات المنفصلة الموجودة داخل ZIP إلى GitHub.
+هذا الملف للتصدير والمراجعة فقط.
 لا يحتوي على توكن البوت أو رابط قاعدة البيانات.
 
 ================================================================================
 📁 requirements.txt
 ================================================================================
-python-telegram-bot==22.8
+python-telegram-bot[job-queue]==22.8
 requests==2.31.0
 psycopg2-binary==2.9.9
 
@@ -44,6 +44,8 @@ MISE_PYTHON_GITHUB_ATTESTATIONS=false
 - اشتراك إجباري وحظر وإذاعة.
 - رسالة ترحيب مدمجة بالقائمة الرئيسية.
 - حد قابل للتعديل لعدد الإيميلات لكل مستخدم.
+- عرض دومينات مدفوعة شكلية يديرها الأدمن.
+- رسائل واضحة لأسباب فشل تحميل صندوق الوارد.
 - أزرار تلجرام ملوّنة.
 """
 
@@ -343,6 +345,71 @@ def normalize_telegram_username(value: str) -> str:
 
 def get_admin_contact_username() -> str:
     return normalize_telegram_username(get_setting("admin_contact_username", ""))
+
+
+def normalize_paid_domain(value: str) -> str:
+    """تنظيف اسم دومين شكلي مدفوع والتحقق من صيغته."""
+    domain = str(value or "").strip().lower().lstrip("@")
+    if len(domain) > 253 or "." not in domain:
+        return ""
+
+    labels = domain.split(".")
+    if any(
+        not label
+        or len(label) > 63
+        or label.startswith("-")
+        or label.endswith("-")
+        or not re.fullmatch(r"[a-z0-9-]+", label)
+        for label in labels
+    ):
+        return ""
+    return domain
+
+
+def get_paid_domains() -> list[str]:
+    """جلب الدومينات الشكلية المدفوعة من الإعدادات بترتيب إضافتها."""
+    raw = get_setting("paid_domains", "")
+    domains = []
+    for line in raw.splitlines():
+        domain = normalize_paid_domain(line)
+        if domain and domain not in domains:
+            domains.append(domain)
+    return domains
+
+
+def save_paid_domains(domains) -> bool:
+    cleaned = []
+    for value in domains:
+        domain = normalize_paid_domain(value)
+        if domain and domain not in cleaned:
+            cleaned.append(domain)
+    return set_setting("paid_domains", "\n".join(cleaned))
+
+
+def add_paid_domain(value: str):
+    domain = normalize_paid_domain(value)
+    if not domain:
+        return False, "invalid", ""
+
+    domains = get_paid_domains()
+    if domain in domains:
+        return False, "exists", domain
+
+    domains.append(domain)
+    if not save_paid_domains(domains):
+        return False, "save_failed", domain
+    return True, "added", domain
+
+
+def remove_paid_domain(index: int):
+    domains = get_paid_domains()
+    if index < 0 or index >= len(domains):
+        return False, ""
+
+    removed = domains.pop(index)
+    if not save_paid_domains(domains):
+        return False, ""
+    return True, removed
 
 
 def build_main_menu_text(user_id: int) -> str:
@@ -882,11 +949,12 @@ def subscription_prompt(_lang: str, channel_username: str, message: str):
 
 # ================== mail.tm API ==================
 
-def mail_request(method: str, path: str, **kwargs):
-    """طلب إلى mail.tm مع إعادة محاولة للأخطاء المؤقتة."""
-    last_error = None
+def mail_request(method: str, path: str, return_error=False, **kwargs):
+    """طلب إلى mail.tm مع إعادة محاولة وإبقاء سبب الفشل عند طلبه."""
+    last_response = None
+    last_error_code = None
     supplied_headers = kwargs.pop("headers", {}) or {}
-    request_headers = {"User-Agent": "TelegramTempMailBot/3.0", **supplied_headers}
+    request_headers = {"User-Agent": "TelegramTempMailBot/3.1", **supplied_headers}
 
     for attempt in range(3):
         try:
@@ -897,19 +965,28 @@ def mail_request(method: str, path: str, **kwargs):
                 headers=request_headers,
                 **kwargs,
             )
+            last_response = response
             if response.status_code not in (429, 500, 502, 503, 504):
-                return response
+                return (response, None) if return_error else response
+
+            last_error_code = f"http_{response.status_code}"
             print(f"⚠️ mail.tm {path}: HTTP {response.status_code}")
+        except requests.Timeout as error:
+            last_error_code = "timeout"
+            print(f"⚠️ mail.tm {path}: {type(error).__name__}: {error}")
+        except requests.ConnectionError as error:
+            last_error_code = "connection"
+            print(f"⚠️ mail.tm {path}: {type(error).__name__}: {error}")
         except requests.RequestException as error:
-            last_error = error
+            last_error_code = "network"
             print(f"⚠️ mail.tm {path}: {type(error).__name__}: {error}")
 
         if attempt < 2:
             time.sleep(2 ** attempt)
 
-    if last_error:
-        print(f"❌ فشل الاتصال النهائي بـ mail.tm: {last_error}")
-    return None
+    if return_error:
+        return last_response, last_error_code or "network"
+    return last_response
 
 
 def get_available_domains():
@@ -962,21 +1039,125 @@ def create_email():
         return None, None
 
 
-def check_inbox(token):
+def check_inbox_detailed(token):
+    """فحص الصندوق مع سبب واضح للفشل دون كشف التوكن."""
     headers = {"Authorization": f"Bearer {token}"}
-    response = mail_request("GET", "/messages", headers=headers)
+    response, request_error = mail_request(
+        "GET",
+        "/messages",
+        headers=headers,
+        return_error=True,
+    )
+
     if response is None:
-        return None
-    if response.status_code == 200:
+        return {"messages": None, "error": request_error or "network", "status": None}
+
+    status = response.status_code
+    if status == 200:
         try:
-            return response.json().get("hydra:member", [])
-        except ValueError as error:
+            payload = response.json()
+            messages = payload.get("hydra:member", [])
+            if not isinstance(messages, list):
+                raise ValueError("hydra:member ليس قائمة")
+            return {"messages": messages, "error": None, "status": 200}
+        except (ValueError, AttributeError) as error:
             print(f"⚠️ رد صندوق الوارد غير صالح: {error}")
-    elif response.status_code == 401:
+            return {"messages": None, "error": "invalid_response", "status": 200}
+
+    if status == 401:
         print("⚠️ توكن البريد غير صالح أو منتهي")
+        error_code = "token_invalid"
+    elif status == 429:
+        print("⚠️ ضغط مؤقت على خدمة البريد: HTTP 429")
+        error_code = "rate_limited"
+    elif status in (500, 502, 503, 504):
+        print(f"⚠️ خدمة البريد غير متاحة مؤقتاً: HTTP {status}")
+        error_code = "service_unavailable"
     else:
-        print(f"⚠️ فشل فحص الصندوق: HTTP {response.status_code}")
-    return None
+        print(f"⚠️ فشل فحص الصندوق: HTTP {status}")
+        error_code = "http_error"
+
+    return {"messages": None, "error": error_code, "status": status}
+
+
+def check_inbox(token):
+    """واجهة متوافقة مع منطق عرض تفاصيل الرسالة القديم."""
+    result = check_inbox_detailed(token)
+    return result["messages"] if result.get("error") is None else None
+
+
+def build_inbox_error_view(error_code, email_index: int, status=None):
+    """رسالة وأزرار مناسبة لسبب فشل تحميل صندوق الوارد."""
+    if error_code == "token_invalid":
+        text = (
+            "⚠️ توكن هذا البريد غير صالح أو منتهي.\n\n"
+            "لم يعد بالإمكان تحميل رسائله. يرجى حذف هذا البريد وإنشاء بريد جديد."
+        )
+        rows = [
+            [InlineKeyboardButton(
+                "🗑️ حذف هذا البريد",
+                callback_data=f"confirm_delete_{email_index}",
+                style="danger",
+            )],
+            [InlineKeyboardButton(
+                "✨ إنشاء بريد جديد",
+                callback_data="create_email",
+                style="success",
+            )],
+            [InlineKeyboardButton(
+                get_text("ar", "btn_back"),
+                callback_data="select_inbox",
+                style="primary",
+            )],
+        ]
+        return text, InlineKeyboardMarkup(rows)
+
+    if error_code == "rate_limited":
+        text = (
+            "⏳ يوجد ضغط مؤقت على خدمة البريد.\n\n"
+            "انتظر قليلاً ثم اضغط تحديث للمحاولة من جديد."
+        )
+    elif error_code == "service_unavailable":
+        text = (
+            "🛠️ خدمة البريد متوقفة أو تواجه مشكلة مؤقتة.\n\n"
+            "حاول التحديث بعد قليل."
+        )
+    elif error_code == "timeout":
+        text = (
+            "⏱️ انتهت مهلة الاتصال بخدمة البريد.\n\n"
+            "هذه مشكلة مؤقتة، حاول التحديث لاحقاً."
+        )
+    elif error_code in ("connection", "network"):
+        text = (
+            "🌐 تعذر الاتصال بخدمة البريد مؤقتاً.\n\n"
+            "تحقق لاحقاً واضغط تحديث للمحاولة."
+        )
+    elif error_code == "invalid_response":
+        text = (
+            "⚠️ وصلت استجابة غير صالحة من خدمة البريد.\n\n"
+            "حاول التحديث بعد قليل."
+        )
+    elif error_code == "http_error" and status:
+        text = (
+            f"⚠️ تعذر تحميل الرسائل بسبب خطأ HTTP {status}.\n\n"
+            "حاول التحديث لاحقاً."
+        )
+    else:
+        text = get_text("ar", "error_load_messages")
+
+    rows = [
+        [InlineKeyboardButton(
+            get_text("ar", "btn_refresh"),
+            callback_data=f"inbox_{email_index}",
+            style="success",
+        )],
+        [InlineKeyboardButton(
+            get_text("ar", "btn_back"),
+            callback_data="select_inbox",
+            style="primary",
+        )],
+    ]
+    return text, InlineKeyboardMarkup(rows)
 
 
 def get_message_content(message_id, token):
@@ -1221,6 +1402,7 @@ def get_main_menu_keyboard(_lang, user_id):
             InlineKeyboardButton(get_text("ar", "btn_my_emails"), callback_data="my_emails", style="primary"),
             InlineKeyboardButton(get_text("ar", "btn_inbox"), callback_data="select_inbox", style="primary"),
         ],
+        [InlineKeyboardButton("🌐 تغيير الدومين", callback_data="change_domain", style="primary")],
         [InlineKeyboardButton(get_text("ar", "btn_delete_all"), callback_data="confirm_delete_all", style="danger")],
     ]
     if is_admin(user_id):
@@ -1274,6 +1456,7 @@ def get_admin_panel_keyboard(_lang, user_id):
         [InlineKeyboardButton("⚙️ الإعدادات", callback_data="section_settings", style="primary")],
         [InlineKeyboardButton("👥 إدارة الأعضاء", callback_data="section_members", style="primary")],
         [InlineKeyboardButton("🔢 حد إنشاء الإيميلات", callback_data="section_email_limit", style="primary")],
+        [InlineKeyboardButton("🌐 إدارة الدومينات المدفوعة", callback_data="section_paid_domains", style="primary")],
     ]
     if user_id == ADMIN_ID:
         keyboard.append([InlineKeyboardButton("👮 إدارة المشرفين", callback_data="section_admins", style="primary")])
@@ -1428,6 +1611,86 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # عرض الدومينات الشكلية المدفوعة للمستخدم
+    if data == "change_domain":
+        domains = get_paid_domains()
+        if not domains:
+            await query.edit_message_text(
+                "🌐 لا توجد دومينات مدفوعة متاحة حالياً.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        get_text(lang, "btn_back"),
+                        callback_data="back_to_menu",
+                        style="primary",
+                    )
+                ]]),
+            )
+            return
+
+        rows = []
+        for index, domain in enumerate(domains):
+            rows.append([
+                InlineKeyboardButton(
+                    f"@{domain}",
+                    callback_data=f"paid_domain_{index}",
+                    transparent=True,
+                )
+            ])
+        rows.append([
+            InlineKeyboardButton(
+                get_text(lang, "btn_back"),
+                callback_data="back_to_menu",
+                style="primary",
+            )
+        ])
+        await query.edit_message_text(
+            "🌐 اختر الدومين الذي تريد استخدامه:",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return
+
+    if re.fullmatch(r"paid_domain_\d+", data):
+        domain_index = int(data.rsplit("_", 1)[1])
+        domains = get_paid_domains()
+        if domain_index >= len(domains):
+            await query.edit_message_text(
+                "⚠️ هذا الدومين لم يعد متاحاً.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        get_text(lang, "btn_back"),
+                        callback_data="change_domain",
+                        style="primary",
+                    )
+                ]]),
+            )
+            return
+
+        domain = domains[domain_index]
+        rows = []
+        contact_username = get_admin_contact_username()
+        if contact_username:
+            rows.append([
+                InlineKeyboardButton(
+                    "💬 التواصل مع الأدمن",
+                    url=f"https://t.me/{contact_username}",
+                    style="success",
+                )
+            ])
+        rows.append([
+            InlineKeyboardButton(
+                get_text(lang, "btn_back"),
+                callback_data="change_domain",
+                style="primary",
+            )
+        ])
+        await query.edit_message_text(
+            "💎 هذه الخدمة مدفوعة.\n\n"
+            f"🌐 الدومين المختار: @{domain}\n\n"
+            "يرجى التواصل مع الأدمن لاستخدام هذا الدومين.",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return
+
     # إنشاء إيميل
     if data == "create_email":
         current_count = len(get_user_emails(user_id))
@@ -1505,14 +1768,16 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if email_index >= len(emails):
             return
         email_data = emails[email_index]
-        messages = await asyncio.to_thread(check_inbox, email_data["token"])
+        inbox_result = await asyncio.to_thread(check_inbox_detailed, email_data["token"])
+        messages = inbox_result.get("messages")
 
-        if messages is None:
-            await query.edit_message_text(get_text(lang, "error_load_messages"),
-                                          reply_markup=InlineKeyboardMarkup([
-                                              [InlineKeyboardButton(get_text(lang, "btn_refresh"), callback_data=f"inbox_{email_index}")],
-                                              [InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="select_inbox")]
-                                          ]))
+        if inbox_result.get("error") is not None:
+            error_text, error_keyboard = build_inbox_error_view(
+                inbox_result.get("error"),
+                email_index,
+                inbox_result.get("status"),
+            )
+            await query.edit_message_text(error_text, reply_markup=error_keyboard)
             return
 
         if len(messages) == 0:
@@ -1852,6 +2117,121 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                       reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_broadcast")]]))
         return
 
+    if data == "section_paid_domains":
+        if not is_admin(user_id):
+            return
+
+        domains = get_paid_domains()
+        text = "🌐 إدارة الدومينات المدفوعة\n\n"
+        if domains:
+            text += "الدومينات المعروضة للمستخدمين:\n"
+            for index, domain in enumerate(domains, start=1):
+                text += f"{index}. @{domain}\n"
+        else:
+            text += "لا توجد دومينات مضافة حالياً."
+
+        rows = [
+            [InlineKeyboardButton(
+                "➕ إضافة دومين",
+                callback_data="add_paid_domain",
+                style="success",
+            )],
+        ]
+        if domains:
+            rows.append([
+                InlineKeyboardButton(
+                    "🗑️ حذف دومين",
+                    callback_data="delete_paid_domain",
+                    style="danger",
+                )
+            ])
+        rows.append([
+            InlineKeyboardButton(
+                get_text(lang, "btn_back"),
+                callback_data="admin_panel",
+                style="primary",
+            )
+        ])
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    if data == "add_paid_domain":
+        if not is_admin(user_id):
+            return
+        context.user_data["waiting_for"] = "paid_domain_add"
+        await query.edit_message_text(
+            "➕ أرسل اسم الدومين الذي تريد عرضه للمستخدمين.\n\nمثال: example.com",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    get_text(lang, "btn_back"),
+                    callback_data="section_paid_domains",
+                    style="primary",
+                )
+            ]]),
+        )
+        return
+
+    if data == "delete_paid_domain":
+        if not is_admin(user_id):
+            return
+        domains = get_paid_domains()
+        if not domains:
+            await query.edit_message_text(
+                "❌ لا توجد دومينات للحذف.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        get_text(lang, "btn_back"),
+                        callback_data="section_paid_domains",
+                        style="primary",
+                    )
+                ]]),
+            )
+            return
+
+        rows = []
+        for index, domain in enumerate(domains):
+            rows.append([
+                InlineKeyboardButton(
+                    f"🗑️ @{domain}",
+                    callback_data=f"remove_paid_domain_{index}",
+                    style="danger",
+                )
+            ])
+        rows.append([
+            InlineKeyboardButton(
+                get_text(lang, "btn_back"),
+                callback_data="section_paid_domains",
+                style="primary",
+            )
+        ])
+        await query.edit_message_text(
+            "🗑️ اختر الدومين الذي تريد حذفه:",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return
+
+    if re.fullmatch(r"remove_paid_domain_\d+", data):
+        if not is_admin(user_id):
+            return
+        domain_index = int(data.rsplit("_", 1)[1])
+        success, removed_domain = remove_paid_domain(domain_index)
+        result_text = (
+            f"✅ تم حذف الدومين @{removed_domain}."
+            if success
+            else "❌ تعذر حذف الدومين."
+        )
+        await query.edit_message_text(
+            result_text,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    get_text(lang, "btn_back"),
+                    callback_data="section_paid_domains",
+                    style="primary",
+                )
+            ]]),
+        )
+        return
+
     if data == "section_email_limit":
         if not is_admin(user_id):
             return
@@ -2163,7 +2543,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(user_id):
             await query.answer(get_text(lang, "unauthorized"), show_alert=True)
             return
-        text = "ℹ️ معلومات البوت\n\n🤖 الاسم: بوت الإيميلات المؤقتة\n📌 الإصدار: 3.0\n📧 الخدمة: mail.tm\n✅ الواجهة: العربية"
+        text = "ℹ️ معلومات البوت\n\n🤖 الاسم: بوت الإيميلات المؤقتة\n📌 الإصدار: 3.1\n📧 الخدمة: mail.tm\n✅ الواجهة: العربية"
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="admin_panel")]]))
         return
 
@@ -2282,6 +2662,42 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         await update.message.reply_text(f"✅ تم الإرسال\nنجح: {okc}\nفشل: {fail}",
                                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_broadcast")]]))
+        return
+
+    # إضافة دومين شكلي مدفوع من لوحة الأدمن
+    if waiting_for == "paid_domain_add" and is_admin(user_id):
+        success, result, domain = add_paid_domain(message.text or "")
+        if not success:
+            if result == "invalid":
+                response_text = "❌ اسم الدومين غير صحيح. أرسله مثل example.com"
+            elif result == "exists":
+                response_text = f"⚠️ الدومين @{domain} مضاف مسبقاً."
+            else:
+                response_text = "❌ تعذر حفظ الدومين، حاول مرة أخرى."
+
+            await message.reply_text(
+                response_text,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        get_text(lang, "btn_back"),
+                        callback_data="section_paid_domains",
+                        style="primary",
+                    )
+                ]]),
+            )
+            return
+
+        context.user_data["waiting_for"] = None
+        await message.reply_text(
+            f"✅ تم إضافة الدومين الشكلي @{domain} للمستخدمين.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    get_text(lang, "btn_back"),
+                    callback_data="section_paid_domains",
+                    style="primary",
+                )
+            ]]),
+        )
         return
 
     # تحديد الحد العام لإنشاء الإيميلات
