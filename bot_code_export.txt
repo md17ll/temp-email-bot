@@ -1,37 +1,39 @@
 ================================================================================
-                    بوت الإيميلات المؤقتة - نسخة معدلة
-                    Telegram Temp Email Bot - Modified Export
+                  بوت الإيميلات المؤقتة - نسخة Railway النهائية
 ================================================================================
 
-================================================================================
-📁 الملف 1: requirements.txt
-================================================================================
+هذا الملف للتصدير والمراجعة. ارفع الملفات المنفصلة الموجودة داخل ZIP إلى GitHub.
+لا يحتوي على توكن البوت أو رابط قاعدة البيانات.
 
-python-telegram-bot[job-queue]==22.8
+================================================================================
+📁 requirements.txt
+================================================================================
+python-telegram-bot==22.8
 requests==2.31.0
 psycopg2-binary==2.9.9
 
 ================================================================================
-📁 متغيرات Railway المطلوبة
+📁 Procfile
 ================================================================================
-
-TELEGRAM_BOT_TOKEN=ضع_توكن_البوت_داخل_Railway
-DATABASE_URL=ضع_رابط_PostgreSQL_داخل_Railway
-ADMIN_TELEGRAM_ID=ضع_آيدي_المشرف_الرئيسي_داخل_Railway
-
-ملاحظة: لا توجد قيم حقيقية للتوكن أو قاعدة البيانات داخل هذا الملف.
+worker: python telegram_bot.py
 
 ================================================================================
-📁 الملف 2: start.sh
+📁 start.sh
 ================================================================================
-
 #!/bin/bash
 python telegram_bot.py
 
 ================================================================================
-📁 الملف 3: telegram_bot.py
+📁 متغيرات Railway المطلوبة — الأسماء فقط
 ================================================================================
+TELEGRAM_BOT_TOKEN
+DATABASE_URL
+ADMIN_TELEGRAM_ID
+MISE_PYTHON_GITHUB_ATTESTATIONS=false
 
+================================================================================
+📁 telegram_bot.py
+================================================================================
 #!/usr/bin/env python3
 """
 بوت تلجرام لإنشاء إيميلات مؤقتة متعددة عبر mail.tm.
@@ -55,7 +57,7 @@ from html import escape, unescape
 import psycopg2
 import requests
 from psycopg2.extras import Json, RealDictCursor
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton as TelegramInlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -79,6 +81,38 @@ bot_offline_message = ""
 
 # 0 يعني غير محدود إلى أن يحدد الأدمن رقماً من لوحة التحكم
 DEFAULT_EMAIL_LIMIT = 0
+
+
+def _default_button_style(text: str, callback_data: str | None = None, url: str | None = None) -> str:
+    """اختيار لون افتراضي مرتب لكل زر دون تغيير وظيفته."""
+    value = f"{text or ''} {callback_data or ''}".lower()
+    danger_words = (
+        "حذف", "إلغاء", "حظر", "إيقاف", "تعطيل", "danger", "delete", "remove", "ban", "cancel",
+    )
+    success_words = (
+        "إنشاء", "تأكيد", "تحقق", "تفعيل", "تشغيل", "تحديث", "حفظ", "إضافة", "فك حظر",
+        "success", "create", "confirm", "verify", "enable", "refresh", "save", "add", "unban",
+    )
+    if any(word in value for word in danger_words):
+        return "danger"
+    if any(word in value for word in success_words):
+        return "success"
+    if url:
+        return "primary"
+    return "primary"
+
+
+def InlineKeyboardButton(text, *args, style=None, transparent=False, **kwargs):
+    """غلاف يلوّن كل الأزرار افتراضياً، مع السماح بزر شفاف مقصود فقط."""
+    if transparent:
+        return TelegramInlineKeyboardButton(text, *args, **kwargs)
+    if style is None:
+        style = _default_button_style(
+            str(text),
+            callback_data=kwargs.get("callback_data"),
+            url=kwargs.get("url"),
+        )
+    return TelegramInlineKeyboardButton(text, *args, style=style, **kwargs)
 
 # ================== قاعدة البيانات ==================
 
@@ -164,6 +198,16 @@ def init_database():
                     email_address TEXT PRIMARY KEY,
                     last_message_id TEXT,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # يمنع تكرار إشعار اشتراك العضو في القناة الإجبارية.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS subscription_notifications (
+                    telegram_id BIGINT NOT NULL,
+                    channel_key TEXT NOT NULL,
+                    notified_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (telegram_id, channel_key)
                 )
             """)
 
@@ -289,6 +333,18 @@ def get_email_limit() -> int:
         return DEFAULT_EMAIL_LIMIT
 
 
+def normalize_telegram_username(value: str) -> str:
+    """تنظيف والتحقق من يوزر تلجرام دون @."""
+    username = str(value or "").strip().lstrip("@")
+    if re.fullmatch(r"[A-Za-z0-9_]{5,32}", username):
+        return username
+    return ""
+
+
+def get_admin_contact_username() -> str:
+    return normalize_telegram_username(get_setting("admin_contact_username", ""))
+
+
 def build_main_menu_text(user_id: int) -> str:
     """دمج رسالة الترحيب مع القائمة الرئيسية في رسالة واحدة."""
     emails_count = len(get_user_emails(user_id))
@@ -361,6 +417,49 @@ def unban_user_db(user_id: int) -> bool:
 
 
 
+# ---------- إشعارات الاشتراك الإجباري ----------
+def subscription_notification_exists(user_id: int, channel_key: str) -> bool:
+    conn = get_db_connection()
+    if not conn:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM subscription_notifications WHERE telegram_id=%s AND channel_key=%s",
+                (user_id, channel_key),
+            )
+            return cur.fetchone() is not None
+    except Exception as e:
+        print(f"⚠️ خطأ في فحص سجل إشعار الاشتراك: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def mark_subscription_notified(user_id: int, channel_key: str) -> bool:
+    conn = get_db_connection()
+    if not conn:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO subscription_notifications(telegram_id, channel_key)
+                VALUES (%s, %s)
+                ON CONFLICT (telegram_id, channel_key) DO NOTHING
+                """,
+                (user_id, channel_key),
+            )
+            conn.commit()
+            return True
+    except Exception as e:
+        print(f"⚠️ خطأ في حفظ سجل إشعار الاشتراك: {e}")
+        conn.rollback()
+        return False
+    finally:
+        conn.close()
+
+
 # ---------- Email Seen (جديد) ----------
 def get_last_seen_message_id(email_address: str) -> str:
     """يرجع آخر message_id تم إرساله لهذا البريد (أو نص فارغ)."""
@@ -419,12 +518,60 @@ def delete_email_seen_records(addresses) -> None:
         conn.close()
 
 
+def _db_row_to_user_info(row) -> dict:
+    """تحويل صف العضو من PostgreSQL إلى نفس شكل بيانات الذاكرة."""
+    return {
+        "lang": "ar",
+        "first_name": row.get("first_name", "") or "",
+        "last_name": row.get("last_name", "") or "",
+        "username": row.get("username", "") or "",
+        "emails": row.get("emails") or [],
+    }
+
+
 def find_user_by_username_or_id(search_value: str):
-    """البحث الدقيق عن عضو عبر ID أو username."""
+    """البحث عن العضو من PostgreSQL مباشرة، ثم مزامنة نسخة الذاكرة."""
     query = str(search_value or "").strip().lstrip("@").lower()
     if not query:
         return None
 
+    conn = get_db_connection()
+    if conn:
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                if query.isdigit():
+                    cur.execute(
+                        """
+                        SELECT telegram_id, language, first_name, last_name, username, emails
+                        FROM bot_users
+                        WHERE telegram_id=%s
+                        LIMIT 1
+                        """,
+                        (int(query),),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT telegram_id, language, first_name, last_name, username, emails
+                        FROM bot_users
+                        WHERE LOWER(COALESCE(username, ''))=%s
+                        LIMIT 1
+                        """,
+                        (query,),
+                    )
+                row = cur.fetchone()
+
+            if row:
+                user_id = int(row["telegram_id"])
+                info = _db_row_to_user_info(row)
+                user_database[str(user_id)] = info
+                return user_id, info
+        except Exception as error:
+            print(f"⚠️ فشل البحث عن العضو في قاعدة البيانات: {error}")
+        finally:
+            conn.close()
+
+    # احتياط عند تعذر الاتصال المؤقت بقاعدة البيانات.
     if query.isdigit() and query in user_database:
         return int(query), user_database[query]
 
@@ -436,23 +583,53 @@ def find_user_by_username_or_id(search_value: str):
 
 
 def clear_user_emails(user_id: int):
-    """حذف إيميلات العضو من بيانات البوت فقط، مع تنظيف سجل الرسائل."""
-    uid = str(user_id)
-    if uid not in user_database:
+    """حذف إيميلات العضو من PostgreSQL مباشرة وتحديث الذاكرة فوراً."""
+    conn = get_db_connection()
+    if not conn:
         return False, 0
 
-    data = user_database[uid]
-    old_emails = list(data.get("emails") or [])
-    addresses = [(item or {}).get("address") for item in old_emails]
-    data["emails"] = []
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT telegram_id, language, first_name, last_name, username, emails
+                FROM bot_users
+                WHERE telegram_id=%s
+                FOR UPDATE
+                """,
+                (int(user_id),),
+            )
+            row = cur.fetchone()
+            if not row:
+                conn.rollback()
+                return False, 0
 
-    if not save_single_user(uid, data):
-        data["emails"] = old_emails
+            old_emails = list(row.get("emails") or [])
+            addresses = [(item or {}).get("address") for item in old_emails]
+            cur.execute(
+                """
+                UPDATE bot_users
+                SET emails='[]'::jsonb, updated_at=CURRENT_TIMESTAMP
+                WHERE telegram_id=%s
+                """,
+                (int(user_id),),
+            )
+            conn.commit()
+
+        info = _db_row_to_user_info(row)
+        info["emails"] = []
+        user_database[str(user_id)] = info
+        delete_email_seen_records(addresses)
+        return True, len(old_emails)
+    except Exception as error:
+        print(f"❌ فشل حذف إيميلات العضو من قاعدة البيانات: {error}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         return False, 0
-
-    user_database[uid] = data
-    delete_email_seen_records(addresses)
-    return True, len(old_emails)
+    finally:
+        conn.close()
 
 
 # ================== إدارة المشرفين (مثل كودك) ==================
@@ -927,110 +1104,78 @@ def remove_user_email(user_id, email):
     if save_single_user(str(user_id), data):
         delete_email_seen_records([email])
 
-# ================== مزامنة الرسائل تلقائياً ==================
+async def notify_admin_new_user(context: ContextTypes.DEFAULT_TYPE, user) -> None:
+    """إشعار المشرف الرئيسي مرة واحدة عند دخول عضو جديد للبوت."""
+    if user is None or user.id == ADMIN_ID:
+        return
 
-async def poll_inboxes_job(context: ContextTypes.DEFAULT_TYPE):
-    """يفحص الإيميلات المحفوظة ويرسل الرسائل الجديدة دون تعليم الفاشل كمقروء."""
-    for uid_str, info in list(user_database.items()):
-        try:
-            user_id = int(uid_str)
-        except (TypeError, ValueError):
-            continue
+    full_name = user.first_name or "غير معروف"
+    if user.last_name:
+        full_name += f" {user.last_name}"
+    username = f"@{user.username}" if user.username else "لا يوجد"
+    text = (
+        "🆕 <b>مستخدم جديد دخل البوت</b>\n\n"
+        f"👤 الاسم: {telegram_html(full_name)}\n"
+        f"🆔 اليوزر: {telegram_html(username)}\n"
+        f"🔢 ID: <code>{user.id}</code>"
+    )
+    try:
+        await context.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="HTML")
+    except Exception as e:
+        print(f"⚠️ فشل إرسال إشعار دخول المستخدم {user.id}: {e}")
 
-        emails = (info or {}).get("emails") or []
-        if not emails or ((not is_admin(user_id)) and is_banned(user_id)):
-            continue
 
-        for email_info in emails:
-            address = (email_info or {}).get("address")
-            token = (email_info or {}).get("token")
-            if not address or not token:
-                continue
+async def register_user_activity(context: ContextTypes.DEFAULT_TYPE, user) -> bool:
+    """تحديث بيانات العضو وإرسال إشعار الدخول عند أول ظهور فقط."""
+    if user is None:
+        return False
 
-            last_seen = get_last_seen_message_id(address)
-            messages = await asyncio.to_thread(check_inbox, token)
-            if not messages:
-                continue
+    is_new = str(user.id) not in user_database
+    update_user_info(user.id, user)
+    if user.id == ADMIN_ID and user.username and not get_admin_contact_username():
+        set_setting("admin_contact_username", user.username)
+    if is_new:
+        await notify_admin_new_user(context, user)
+    return is_new
 
-            new_messages = []
-            for message in messages:
-                message_id = (message or {}).get("id")
-                if not message_id:
-                    continue
-                if last_seen and message_id == last_seen:
-                    break
-                new_messages.append(message)
 
-            if not new_messages:
-                continue
+async def notify_admin_subscription(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    channel_info,
+) -> None:
+    """إشعار المشرف مرة واحدة عند تحقق اشتراك العضو بالقناة الإجبارية."""
+    if user_id == ADMIN_ID or not channel_info:
+        return
 
-            # mail.tm يعيد الأحدث أولاً؛ نرسل الأقدم أولاً.
-            for message in list(reversed(new_messages))[:5]:
-                message_id = (message or {}).get("id")
-                if not message_id:
-                    continue
+    channel_username = str(channel_info.get("channel_username") or "").lstrip("@")
+    channel_id = channel_info.get("channel_id")
+    channel_key = str(channel_id or channel_username).lower()
+    if not channel_key or subscription_notification_exists(user_id, channel_key):
+        return
 
-                full = await asyncio.to_thread(get_message_content, message_id, token) or {}
-                sender_raw = (full.get("from") or {}).get("address") or "غير معروف"
-                subject_raw = full.get("subject") or "بدون موضوع"
-                date_raw = full.get("createdAt") or ""
-                content_raw = get_message_text(full)
-                if len(content_raw) > 3500:
-                    content_raw = content_raw[:3500] + "\n\n... (الرسالة طويلة جداً)"
+    info = user_database.get(str(user_id), {}) or {}
+    full_name = info.get("first_name") or "غير معروف"
+    if info.get("last_name"):
+        full_name += f" {info['last_name']}"
+    username = f"@{info.get('username')}" if info.get("username") else "لا يوجد"
+    text = (
+        "✅ <b>عضو اشترك بالقناة الإجبارية</b>\n\n"
+        f"👤 الاسم: {telegram_html(full_name)}\n"
+        f"🆔 اليوزر: {telegram_html(username)}\n"
+        f"🔢 ID: <code>{user_id}</code>\n"
+        f"📢 القناة: @{telegram_html(channel_username)}"
+    )
+    try:
+        await context.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="HTML")
+        mark_subscription_notified(user_id, channel_key)
+    except Exception as e:
+        print(f"⚠️ فشل إرسال إشعار اشتراك المستخدم {user_id}: {e}")
 
-                otp = extract_otp(content_raw)
-                html_parts = [
-                    "📩 وصلت رسالة جديدة",
-                    f"📧 {telegram_html(address)}",
-                    f"📧 من: {telegram_html(sender_raw)}",
-                    f"📌 الموضوع: {telegram_html(subject_raw)}",
-                ]
-                plain_parts = [
-                    "📩 وصلت رسالة جديدة",
-                    f"📧 {address}",
-                    f"📧 من: {sender_raw}",
-                    f"📌 الموضوع: {subject_raw}",
-                ]
-                if date_raw:
-                    html_parts.append(f"📅 {telegram_html(date_raw)}")
-                    plain_parts.append(f"📅 {date_raw}")
-                if otp:
-                    html_parts.append(f"🔢 OTP: <code>{telegram_html(otp)}</code>")
-                    plain_parts.append(f"🔢 OTP: {otp}")
 
-                html_parts.extend(["", "📝 المحتوى:", telegram_html(content_raw)])
-                plain_parts.extend(["", "📝 المحتوى:", content_raw])
-
-                sent_successfully = False
-                try:
-                    await context.bot.send_message(
-                        chat_id=user_id,
-                        text="\n".join(html_parts),
-                        parse_mode="HTML",
-                        disable_web_page_preview=True,
-                    )
-                    sent_successfully = True
-                except Exception as html_error:
-                    print(
-                        f"⚠️ فشل إرسال HTML إلى {user_id}: "
-                        f"{type(html_error).__name__}: {html_error}"
-                    )
-                    try:
-                        await context.bot.send_message(
-                            chat_id=user_id,
-                            text="\n".join(plain_parts),
-                            disable_web_page_preview=True,
-                        )
-                        sent_successfully = True
-                    except Exception as plain_error:
-                        print(
-                            f"❌ فشل إرسال البريد إلى {user_id}: "
-                            f"{type(plain_error).__name__}: {plain_error}"
-                        )
-
-                if not sent_successfully:
-                    break
-                set_last_seen_message_id(address, message_id)
+# ================== عرض البريد يدوياً فقط ==================
+# لا توجد مهمة خلفية لإرسال رسائل البريد إلى محادثة البوت.
+# المستخدم يفتح «الرسائل الواردة»، يختار الإيميل، ثم يقرأ رسائله.
 
 # ================== النصوص العربية ==================
 
@@ -1169,8 +1314,10 @@ async def guard_user(update_or_query, context, user_id: int, lang: str) -> bool:
     """
     يرجع False إذا لازم نوقف (محظور/غير مشترك/البوت مطفي)
     """
+    admin_user = is_admin(user_id)
+
     # محظور؟
-    if not is_admin(user_id) and is_banned(user_id):
+    if not admin_user and is_banned(user_id):
         msg = get_text(lang, "banned")
         if hasattr(update_or_query, "message") and update_or_query.message:
             await update_or_query.message.reply_text(msg)
@@ -1182,7 +1329,7 @@ async def guard_user(update_or_query, context, user_id: int, lang: str) -> bool:
         return False
 
     # بوت مطفي؟
-    if not bot_active and not is_admin(user_id):
+    if not bot_active and not admin_user:
         text = f"⚠️ البوت متوقف مؤقتاً\n\n{bot_offline_message}" if bot_offline_message else "⚠️ البوت متوقف مؤقتاً."
         if hasattr(update_or_query, "message") and update_or_query.message:
             await update_or_query.message.reply_text(text)
@@ -1194,7 +1341,7 @@ async def guard_user(update_or_query, context, user_id: int, lang: str) -> bool:
         return False
 
     # اشتراك صارم (لغير الأدمن)
-    if not is_admin(user_id):
+    if not admin_user:
         ok = await check_user_subscription_strict(user_id, context)
         if not ok:
             ch = get_channel_info()
@@ -1210,6 +1357,10 @@ async def guard_user(update_or_query, context, user_id: int, lang: str) -> bool:
                         pass
             return False
 
+        active_channel = get_channel_info()
+        if active_channel:
+            await notify_admin_subscription(context, user_id, active_channel)
+
     return True
 
 
@@ -1222,7 +1373,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = user.id
-    update_user_info(user_id, user)
+    await register_user_activity(context, user)
     lang = "ar"
 
     if not await guard_user(update, context, user_id, lang):
@@ -1282,12 +1433,23 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         current_count = len(get_user_emails(user_id))
         email_limit = get_email_limit()
         if (not is_admin(user_id)) and email_limit > 0 and current_count >= email_limit:
+            contact_username = get_admin_contact_username()
+            rows = []
+            if contact_username:
+                rows.append([
+                    InlineKeyboardButton(
+                        "💬 التواصل مع الأدمن",
+                        url=f"https://t.me/{contact_username}",
+                        style="primary",
+                    )
+                ])
+            rows.append([
+                InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="back_to_menu")
+            ])
             await query.edit_message_text(
                 "⚠️ لقد وصلت إلى الحد المسموح لإنشاء الإيميلات.\n\n"
                 "يرجى التواصل مع الأدمن لإنشاء المزيد من الإيميلات.",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="back_to_menu")
-                ]]),
+                reply_markup=InlineKeyboardMarkup(rows),
             )
             return
 
@@ -1435,7 +1597,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # تأكيد حذف إيميل
-    if data.startswith("confirm_delete_") and data != "confirm_delete_all":
+    if re.fullmatch(r"confirm_delete_\d+", data):
         idx_str = data.split("_", 2)[2]
         if not idx_str.isdigit():
             return
@@ -1452,7 +1614,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text, reply_markup=kb)
         return
 
-    if data.startswith("delete_") and not data.startswith("delete_all"):
+    if re.fullmatch(r"delete_\d+", data):
         idx_str = data.split("_", 1)[1]
         if not idx_str.isdigit():
             return
@@ -1695,13 +1857,18 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         limit = get_email_limit()
         current = "غير محدود" if limit == 0 else str(limit)
+        contact_username = get_admin_contact_username()
+        contact_text = f"@{contact_username}" if contact_username else "غير محدد"
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("✏️ تحديد العدد", callback_data="set_email_limit", style="primary")],
+            [InlineKeyboardButton("👤 إضافة يوزر التواصل", callback_data="set_admin_contact_username", transparent=True)],
             [InlineKeyboardButton("♾️ إلغاء الحد", callback_data="clear_email_limit", style="danger")],
             [InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="admin_panel")],
         ])
         await query.edit_message_text(
-            f"🔢 حد إنشاء الإيميلات\n\nالحد الحالي لكل مستخدم: {current}",
+            "🔢 حد إنشاء الإيميلات\n\n"
+            f"الحد الحالي لكل مستخدم: {current}\n"
+            f"يوزر التواصل مع الأدمن: {contact_text}",
             reply_markup=keyboard,
         )
         return
@@ -1712,6 +1879,19 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["waiting_for"] = "email_limit"
         await query.edit_message_text(
             "🔢 أرسل العدد الأقصى الذي يستطيع كل مستخدم إنشاءه.\n\nمثال: 3",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_email_limit")
+            ]]),
+        )
+        return
+
+    if data == "set_admin_contact_username":
+        if user_id != ADMIN_ID:
+            await query.answer("هذا الإعداد للمشرف الرئيسي فقط.", show_alert=True)
+            return
+        context.user_data["waiting_for"] = "admin_contact_username"
+        await query.edit_message_text(
+            "👤 أرسل يوزر الأدمن الذي سيظهر للمستخدم عند وصوله للحد.\n\nمثال: @username",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_email_limit")
             ]]),
@@ -1999,7 +2179,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = user.id
-    update_user_info(user_id, user)
+    await register_user_activity(context, user)
     lang = "ar"
 
     # حارس منع
@@ -2126,6 +2306,31 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # تحديد يوزر التواصل مع الأدمن - للمشرف الرئيسي فقط
+    if waiting_for == "admin_contact_username" and user_id == ADMIN_ID:
+        username = normalize_telegram_username(message.text or "")
+        if not username:
+            await message.reply_text(
+                "❌ اليوزر غير صحيح. أرسله مثل @username ويتكوّن من أحرف إنجليزية أو أرقام أو _.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_email_limit")
+                ]]),
+            )
+            return
+
+        if not set_setting("admin_contact_username", username):
+            await message.reply_text("❌ فشل حفظ يوزر الأدمن، حاول مرة أخرى.")
+            return
+
+        context.user_data["waiting_for"] = None
+        await message.reply_text(
+            f"✅ تم حفظ يوزر التواصل: @{username}",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_email_limit")
+            ]]),
+        )
+        return
+
     # اختيار عضو لحذف إيميلاته - للمشرف الرئيسي فقط
     if waiting_for == "delete_user_emails" and user_id == ADMIN_ID:
         found = find_user_by_username_or_id(message.text or "")
@@ -2160,7 +2365,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 callback_data=f"confirm_delete_user_emails_{target_id}",
                 style="danger",
             ),
-            InlineKeyboardButton("❌ إلغاء", callback_data="section_members"),
+            InlineKeyboardButton("❌ إلغاء", callback_data="section_members", style="danger"),
         ]])
         await message.reply_text(confirm_text, reply_markup=keyboard)
         return
@@ -2272,19 +2477,9 @@ def main():
     ))
     application.add_error_handler(error_handler)
 
-    try:
-        if application.job_queue:
-            application.job_queue.run_repeating(
-                poll_inboxes_job,
-                interval=20,
-                first=10,
-                name="poll_inboxes",
-            )
-            print("✅ فحص صندوق الوارد التلقائي مفعّل كل 20 ثانية")
-        else:
-            print("⚠️ JobQueue غير متاح - لن يعمل الفحص التلقائي")
-    except Exception as error:
-        print(f"⚠️ فشل تشغيل مهمة فحص البريد: {error}")
+    # يبقى صندوق الوارد يدوياً: المستخدم يختار الإيميل ثم يفتح رسائله.
+    # لا تُشغّل مهمة فحص كل الإيميلات تلقائياً حتى لا يفرض mail.tm حد HTTP 429.
+    print("✅ فحص البريد يعمل يدوياً من زر الرسائل الواردة")
 
     print("🤖 البوت يعمل الآن...")
     application.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
@@ -2295,5 +2490,5 @@ if __name__ == "__main__":
 
 
 ================================================================================
-                              نهاية الملفات
+نهاية الملف
 ================================================================================
