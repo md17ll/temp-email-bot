@@ -17,6 +17,23 @@ jobs:
 
       - name: Apply and validate
         run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('apply_requested_features.py')
+          text = path.read_text(encoding='utf-8')
+          replacements = {
+              "    '''    if data == \"section_health\":" : "    r'''    if data == \"section_health\":" ,
+              "new_limit_section = '''" : "new_limit_section = r'''",
+              "    '''    if data == \"set_member_email_limit\":" : "    r'''    if data == \"set_member_email_limit\":" ,
+              "paginated_callbacks = '''" : "paginated_callbacks = r'''",
+              "    '''    # اختيار العضو عبر ID" : "    r'''    # اختيار العضو عبر ID",
+          }
+          for old, new in replacements.items():
+              if old not in text:
+                  raise RuntimeError(f'Missing script pattern: {old}')
+              text = text.replace(old, new, 1)
+          path.write_text(text, encoding='utf-8')
+          PY
           python apply_requested_features.py
           python - <<'PY'
           import ast
