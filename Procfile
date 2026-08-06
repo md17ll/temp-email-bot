@@ -1,1 +1,1 @@
-worker: python admin_hierarchical_ui.py
+worker: python telegram_bot.py
