@@ -1412,137 +1412,26 @@ def get_messages_keyboard(messages, email_index, _lang):
 
 
 def get_admin_panel_keyboard(_lang, user_id):
-    """لوحة الأدمن الرئيسية بشكل هرمي، وكل زر طويل في سطر مستقل."""
     keyboard = [
-        [InlineKeyboardButton(
-            "📊 الدخول إلى قسم الإحصائيات الشاملة للبوت",
-            callback_data="section_stats",
-            style="primary",
-        )],
-        [InlineKeyboardButton(
-            "👥 الدخول إلى قسم إدارة الأعضاء والمشرفين والحظر",
-            callback_data="admin_members_hub",
-            style="primary",
-        )],
-        [InlineKeyboardButton(
-            "📧 الدخول إلى قسم إدارة الإيميلات والدومينات",
-            callback_data="admin_emails_hub",
-            style="primary",
-        )],
-        [InlineKeyboardButton(
-            "📢 الدخول إلى قسم القنوات والإذاعة وتوجيه الرسائل",
-            callback_data="admin_communication_hub",
-            style="primary",
-        )],
-        [InlineKeyboardButton(
-            "⚙️ الدخول إلى قسم إعدادات البوت ورسالة الترحيب",
-            callback_data="admin_settings_hub",
-            style="primary",
-        )],
-        [InlineKeyboardButton(
-            "🔙 الرجوع إلى القائمة الرئيسية للمستخدم",
-            callback_data="back_to_menu",
-            style="primary",
-        )],
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-
-def get_admin_members_hub_keyboard(_lang, user_id):
-    keyboard = [
-        [InlineKeyboardButton(
-            "👥 فتح قسم إدارة الأعضاء والمستخدمين بالكامل",
-            callback_data="section_members",
-            style="primary",
-        )],
-        [InlineKeyboardButton(
-            "🛑 فتح قسم حظر وفك حظر المستخدمين",
-            callback_data="section_ban",
-            style="danger",
-        )],
+        [InlineKeyboardButton("📊 قسم الإحصائيات", callback_data="section_stats", style="primary")],
+        [InlineKeyboardButton("📢 قسم الإذاعة", callback_data="section_broadcast", style="primary")],
+        [InlineKeyboardButton("📨 قسم توجيه الرسائل", callback_data="section_forward", style="primary")],
+        [InlineKeyboardButton("📢 إدارة القنوات", callback_data="channel_management", style="primary")],
+        [InlineKeyboardButton("⚙️ الإعدادات", callback_data="section_settings", style="primary")],
+        [InlineKeyboardButton("👥 إدارة الأعضاء", callback_data="section_members", style="primary")],
+        [InlineKeyboardButton("🔢 حد إنشاء الإيميلات", callback_data="section_email_limit", style="primary")],
+        [InlineKeyboardButton("🌐 إدارة الدومينات المدفوعة", callback_data="section_paid_domains", style="primary")],
     ]
     if user_id == ADMIN_ID:
-        keyboard.append([InlineKeyboardButton(
-            "👮 فتح قسم إدارة المشرفين والصلاحيات",
-            callback_data="section_admins",
-            style="primary",
-        )])
-    keyboard.append([InlineKeyboardButton(
-        "🔙 الرجوع إلى لوحة تحكم المشرف الرئيسية",
-        callback_data="admin_panel",
-        style="primary",
-    )])
+        keyboard.append([InlineKeyboardButton("👮 إدارة المشرفين", callback_data="section_admins", style="primary")])
+
+    keyboard.extend([
+        [InlineKeyboardButton("🛑 الحظر / فك الحظر", callback_data="section_ban", style="danger")],
+        [InlineKeyboardButton("👋 رسالة الترحيب", callback_data="section_welcome", style="success")],
+        [InlineKeyboardButton("ℹ️ معلومات البوت", callback_data="bot_info")],
+        [InlineKeyboardButton(get_text("ar", "btn_back"), callback_data="back_to_menu")],
+    ])
     return InlineKeyboardMarkup(keyboard)
-
-
-def get_admin_emails_hub_keyboard(_lang):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(
-            "🔢 فتح إعداد الحد الأقصى لإنشاء الإيميلات",
-            callback_data="section_email_limit",
-            style="primary",
-        )],
-        [InlineKeyboardButton(
-            "🌐 فتح قسم إدارة الدومينات المدفوعة",
-            callback_data="section_paid_domains",
-            style="primary",
-        )],
-        [InlineKeyboardButton(
-            "🔙 الرجوع إلى لوحة تحكم المشرف الرئيسية",
-            callback_data="admin_panel",
-            style="primary",
-        )],
-    ])
-
-
-def get_admin_communication_hub_keyboard(_lang):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(
-            "📢 فتح قسم إدارة قنوات الاشتراك الإجباري",
-            callback_data="channel_management",
-            style="primary",
-        )],
-        [InlineKeyboardButton(
-            "📣 فتح قسم إرسال الإذاعة إلى المستخدمين",
-            callback_data="section_broadcast",
-            style="primary",
-        )],
-        [InlineKeyboardButton(
-            "📨 فتح قسم توجيه رسائل المستخدمين إلى الأدمن",
-            callback_data="section_forward",
-            style="primary",
-        )],
-        [InlineKeyboardButton(
-            "🔙 الرجوع إلى لوحة تحكم المشرف الرئيسية",
-            callback_data="admin_panel",
-            style="primary",
-        )],
-    ])
-
-
-def get_admin_settings_hub_keyboard(_lang):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(
-            "⚙️ فتح إعدادات تشغيل وإيقاف البوت",
-            callback_data="section_settings",
-            style="primary",
-        )],
-        [InlineKeyboardButton(
-            "👋 فتح قسم إعداد وتعديل رسالة الترحيب",
-            callback_data="section_welcome",
-            style="success",
-        )],
-        [InlineKeyboardButton(
-            "ℹ️ فتح صفحة معلومات وإصدار البوت",
-            callback_data="bot_info",
-            style="primary",
-        )],
-        [InlineKeyboardButton(
-            "🔙 الرجوع إلى لوحة تحكم المشرف الرئيسية",
-            callback_data="admin_panel",
-            style="primary",
-        )],
-    ])
 
 
 def get_channel_management_keyboard(_lang):
@@ -2016,46 +1905,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await query.edit_message_text("👑 لوحة تحكم المشرف\n\nاختر القسم:",
                                       reply_markup=get_admin_panel_keyboard(lang, user_id))
-        return
-
-    if data == "admin_members_hub":
-        if not is_admin(user_id):
-            await query.answer(get_text(lang, "unauthorized"), show_alert=True)
-            return
-        await query.edit_message_text(
-            "👥 قسم إدارة الأعضاء والمشرفين والحظر\n\nاختر القسم المطلوب:",
-            reply_markup=get_admin_members_hub_keyboard(lang, user_id),
-        )
-        return
-
-    if data == "admin_emails_hub":
-        if not is_admin(user_id):
-            await query.answer(get_text(lang, "unauthorized"), show_alert=True)
-            return
-        await query.edit_message_text(
-            "📧 قسم إدارة الإيميلات والدومينات\n\nاختر القسم المطلوب:",
-            reply_markup=get_admin_emails_hub_keyboard(lang),
-        )
-        return
-
-    if data == "admin_communication_hub":
-        if not is_admin(user_id):
-            await query.answer(get_text(lang, "unauthorized"), show_alert=True)
-            return
-        await query.edit_message_text(
-            "📢 قسم القنوات والإذاعة وتوجيه الرسائل\n\nاختر القسم المطلوب:",
-            reply_markup=get_admin_communication_hub_keyboard(lang),
-        )
-        return
-
-    if data == "admin_settings_hub":
-        if not is_admin(user_id):
-            await query.answer(get_text(lang, "unauthorized"), show_alert=True)
-            return
-        await query.edit_message_text(
-            "⚙️ قسم إعدادات البوت ورسالة الترحيب\n\nاختر القسم المطلوب:",
-            reply_markup=get_admin_settings_hub_keyboard(lang),
-        )
         return
 
     if data == "channel_management":
