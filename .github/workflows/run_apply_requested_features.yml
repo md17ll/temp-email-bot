@@ -1,0 +1,38 @@
+name: Run requested feature update
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/run_apply_requested_features.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply and validate
+        run: |
+          python apply_requested_features.py
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+          ast.parse(Path('telegram_bot.py').read_text(encoding='utf-8'))
+          PY
+          git diff --check
+
+      - name: Commit result
+        run: |
+          rm -f apply_requested_features.py
+          rm -f .github/workflows/apply_member_features.yml
+          rm -f .github/workflows/fix_member_workflow.yml
+          rm -f .github/workflows/run_apply_requested_features.yml
+          git config user.name "md17ll"
+          git config user.email "actions@github.com"
+          git add -A
+          git commit -m "إضافة صفحات الأعضاء وحالة الخدمات وحد عضو خاص"
+          git push origin main
