@@ -16,6 +16,8 @@
 import asyncio
 import os
 import re
+import secrets
+import string
 import time
 import traceback
 from html import escape, unescape
@@ -49,6 +51,29 @@ bot_offline_message = ""
 DEFAULT_EMAIL_LIMIT = 0
 MEMBERS_PAGE_SIZE = 10
 BOT_STARTED_AT = time.time()
+CREATE_EMAIL_COOLDOWN_SECONDS = 5
+INBOX_COOLDOWN_SECONDS = 3
+LEGACY_MAIL_PASSWORD = os.getenv("MAIL_TM_LEGACY_PASSWORD", "TempMail123")
+USER_ACTION_TIMESTAMPS = {}
+
+
+def consume_action_cooldown(user_id: int, action: str, cooldown_seconds: int) -> int:
+    """يرجع الثواني المتبقية، أو صفر ويسجل العملية إذا كان مسموحاً تنفيذها."""
+    now = time.monotonic()
+    key = (int(user_id), str(action))
+    last_time = USER_ACTION_TIMESTAMPS.get(key)
+    if last_time is not None:
+        remaining = cooldown_seconds - (now - last_time)
+        if remaining > 0:
+            return max(1, int(remaining) + 1)
+
+    USER_ACTION_TIMESTAMPS[key] = now
+    if len(USER_ACTION_TIMESTAMPS) > 5000:
+        cutoff = now - 3600
+        stale_keys = [item for item, stamp in USER_ACTION_TIMESTAMPS.items() if stamp < cutoff]
+        for stale_key in stale_keys:
+            USER_ACTION_TIMESTAMPS.pop(stale_key, None)
+    return 0
 
 
 def _default_button_style(text: str, callback_data: str | None = None, url: str | None = None) -> str:
@@ -1041,43 +1066,171 @@ def get_available_domains():
         return []
 
     domains = data.get("hydra:member") or []
-    return [item.get("domain") for item in domains if item.get("domain")]
+    available = []
+    for item in domains:
+        domain = item.get("domain")
+        if not domain:
+            continue
+        if item.get("isActive") is False or item.get("isPrivate") is True:
+            continue
+        if domain not in available:
+            available.append(domain)
+    return available
 
 
 def create_email():
+    """إنشاء بريد مع تجربة الدومينات المجانية المتاحة تلقائياً عند فشل أحدها."""
     try:
         domains = get_available_domains()
         if not domains:
-            return None, None
+            return None, None, None
 
-        import random
-        import string
+        domains = list(domains)
+        secrets.SystemRandom().shuffle(domains)
+        username_chars = string.ascii_lowercase + string.digits
+        password_chars = string.ascii_letters + string.digits
 
-        username = "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
-        email_address = f"{username}@{domains[0]}"
-        password = "TempMail123"
+        for domain in domains:
+            for _ in range(2):
+                username = "".join(secrets.choice(username_chars) for _ in range(10))
+                email_address = f"{username}@{domain}"
+                password = "".join(secrets.choice(password_chars) for _ in range(20))
 
-        response = mail_request(
-            "POST",
-            "/accounts",
-            json={"address": email_address, "password": password},
-        )
-        if response is None or response.status_code != 201:
-            return None, None
+                response = mail_request(
+                    "POST",
+                    "/accounts",
+                    json={"address": email_address, "password": password},
+                )
+                if response is None:
+                    print(f"⚠️ تعذر إنشاء حساب على الدومين @{domain}، تجربة دومين آخر")
+                    break
 
-        token_response = mail_request(
-            "POST",
-            "/token",
-            json={"address": email_address, "password": password},
-        )
-        if token_response is None or token_response.status_code != 200:
-            return None, None
+                if response.status_code == 422:
+                    continue
 
-        token = token_response.json().get("token")
-        return (email_address, token) if token else (None, None)
+                if response.status_code != 201:
+                    print(
+                        f"⚠️ فشل إنشاء حساب على @{domain}: HTTP {response.status_code}، "
+                        "تجربة دومين آخر"
+                    )
+                    break
+
+                token_response = mail_request(
+                    "POST",
+                    "/token",
+                    json={"address": email_address, "password": password},
+                )
+                if token_response is None or token_response.status_code != 200:
+                    status = token_response.status_code if token_response is not None else "network"
+                    print(f"⚠️ فشل جلب توكن البريد {email_address}: {status}")
+                    break
+
+                try:
+                    token = token_response.json().get("token")
+                except (ValueError, AttributeError):
+                    token = None
+                if token:
+                    return email_address, token, password
+                break
+
+        return None, None, None
     except Exception as error:
         print(f"❌ create_email: {type(error).__name__}: {error}")
-        return None, None
+        return None, None, None
+
+
+def refresh_email_token_data(email_data):
+    """تجديد توكن بريد واحد من العنوان وكلمة المرور المحفوظة."""
+    if not isinstance(email_data, dict):
+        return None
+
+    address = str(email_data.get("address") or "").strip()
+    password = str(email_data.get("password") or LEGACY_MAIL_PASSWORD)
+    if not address or not password:
+        return None
+
+    response = mail_request(
+        "POST",
+        "/token",
+        json={"address": address, "password": password},
+    )
+    if response is None or response.status_code != 200:
+        status = response.status_code if response is not None else "network"
+        print(f"⚠️ تعذر تجديد توكن {address}: {status}")
+        return None
+
+    try:
+        token = response.json().get("token")
+    except (ValueError, AttributeError):
+        token = None
+    if not token:
+        return None
+
+    email_data["token"] = token
+    email_data["password"] = password
+    return token
+
+
+def refresh_user_email_token(user_id: int, email_index: int):
+    """تجديد توكن بريد المستخدم وحفظه في PostgreSQL."""
+    emails = get_user_emails(user_id)
+    if email_index < 0 or email_index >= len(emails):
+        return None
+
+    token = refresh_email_token_data(emails[email_index])
+    if not token:
+        return None
+
+    data = get_user_data(user_id)
+    user_database[str(user_id)] = data
+    if not save_single_user(str(user_id), data):
+        print(f"⚠️ تم تجديد التوكن لكن تعذر حفظه للمستخدم {user_id}")
+    return token
+
+
+def check_user_inbox_detailed(user_id: int, email_index: int):
+    """فحص الصندوق وتجديد التوكن تلقائياً مرة واحدة عند HTTP 401."""
+    emails = get_user_emails(user_id)
+    if email_index < 0 or email_index >= len(emails):
+        return {"messages": None, "error": "email_missing", "status": None}
+
+    email_data = emails[email_index]
+    result = check_inbox_detailed(email_data.get("token"))
+    if result.get("error") != "token_invalid":
+        return result
+
+    new_token = refresh_user_email_token(user_id, email_index)
+    if not new_token:
+        return result
+
+    retry_result = check_inbox_detailed(new_token)
+    retry_result["token_refreshed"] = retry_result.get("error") is None
+    return retry_result
+
+
+def get_user_message_content(user_id: int, email_index: int, message_id: str):
+    """تحميل رسالة كاملة، مع تجديد التوكن تلقائياً إذا انتهى أثناء الفتح."""
+    emails = get_user_emails(user_id)
+    if email_index < 0 or email_index >= len(emails):
+        return None
+
+    token = emails[email_index].get("token")
+    for attempt in range(2):
+        headers = {"Authorization": f"Bearer {token}"}
+        response = mail_request("GET", f"/messages/{message_id}", headers=headers)
+        if response is not None and response.status_code == 200:
+            try:
+                return response.json()
+            except ValueError as error:
+                print(f"⚠️ رد محتوى الرسالة غير صالح: {error}")
+                return None
+
+        if attempt == 0 and response is not None and response.status_code == 401:
+            token = refresh_user_email_token(user_id, email_index)
+            if token:
+                continue
+        return None
+    return None
 
 
 def check_inbox_detailed(token):
@@ -1131,8 +1284,8 @@ def build_inbox_error_view(error_code, email_index: int, status=None):
     """رسالة وأزرار مناسبة لسبب فشل تحميل صندوق الوارد."""
     if error_code == "token_invalid":
         text = (
-            "⚠️ توكن هذا البريد غير صالح أو منتهي.\n\n"
-            "لم يعد بالإمكان تحميل رسائله. يرجى حذف هذا البريد وإنشاء بريد جديد."
+            "⚠️ تعذر تجديد جلسة هذا البريد تلقائياً.\n\n"
+            "قد تكون بيانات البريد قديمة أو لم يعد الحساب متاحاً على Mail.tm."
         )
         rows = [
             [InlineKeyboardButton(
@@ -1312,9 +1465,12 @@ def set_user_language(user_id, _lang="ar", user=None):
     save_single_user(str(user_id), data)
 
 
-def add_user_email(user_id, email, token):
+def add_user_email(user_id, email, token, password=None):
     data = get_user_data(user_id)
-    data.setdefault("emails", []).append({"address": email, "token": token})
+    email_record = {"address": email, "token": token}
+    if password:
+        email_record["password"] = password
+    data.setdefault("emails", []).append(email_record)
     user_database[str(user_id)] = data
     save_single_user(str(user_id), data)
 
@@ -1662,14 +1818,34 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query is None or user is None:
         return
 
+    user_id = user.id
+    data = query.data or ""
+    lang = "ar"
+
+    cooldown_remaining = 0
+    if data == "create_email":
+        cooldown_remaining = consume_action_cooldown(
+            user_id, "create_email", CREATE_EMAIL_COOLDOWN_SECONDS
+        )
+    elif re.fullmatch(r"inbox_\d+", data):
+        cooldown_remaining = consume_action_cooldown(
+            user_id, "inbox", INBOX_COOLDOWN_SECONDS
+        )
+
+    if cooldown_remaining > 0:
+        try:
+            await query.answer(
+                f"⏳ انتظر {cooldown_remaining} ثانية قبل إعادة المحاولة.",
+                show_alert=False,
+            )
+        except Exception:
+            pass
+        return
+
     try:
         await query.answer()
     except Exception:
         pass
-
-    user_id = user.id
-    data = query.data or ""
-    lang = "ar"
 
     if not await guard_user(query, context, user_id, lang):
         return
@@ -1787,9 +1963,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        email, token = await asyncio.to_thread(create_email)
+        email, token, password = await asyncio.to_thread(create_email)
         if email and token:
-            add_user_email(user_id, email, token)
+            add_user_email(user_id, email, token, password)
             await query.edit_message_text(
                 get_text(lang, "email_created", email=telegram_html(email)),
                 reply_markup=InlineKeyboardMarkup([[
@@ -1839,7 +2015,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if email_index >= len(emails):
             return
         email_data = emails[email_index]
-        inbox_result = await asyncio.to_thread(check_inbox_detailed, email_data["token"])
+        inbox_result = await asyncio.to_thread(check_user_inbox_detailed, user_id, email_index)
         messages = inbox_result.get("messages")
 
         if inbox_result.get("error") is not None:
@@ -1875,12 +2051,21 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         email_data = emails[email_index]
 
-        messages = await asyncio.to_thread(check_inbox, email_data["token"])
+        inbox_result = await asyncio.to_thread(check_user_inbox_detailed, user_id, email_index)
+        messages = inbox_result.get("messages")
+        if inbox_result.get("error") is not None:
+            error_text, error_keyboard = build_inbox_error_view(
+                inbox_result.get("error"),
+                email_index,
+                inbox_result.get("status"),
+            )
+            await query.edit_message_text(error_text, reply_markup=error_keyboard)
+            return
         if not messages or msg_index >= len(messages):
             return
         msg_id = messages[msg_index]["id"]
 
-        full = await asyncio.to_thread(get_message_content, msg_id, email_data["token"])
+        full = await asyncio.to_thread(get_user_message_content, user_id, email_index, msg_id)
         if not full:
             await query.edit_message_text(get_text(lang, "error_load_message"),
                                           reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data=f"inbox_{email_index}")]]))
@@ -1923,7 +2108,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if email_index >= len(emails):
             return
         email_data = emails[email_index]
-        text = f"📧 <code>{email_data['address']}</code>\n🔑 <code>TempMail123</code>"
+        email_password = email_data.get("password") or LEGACY_MAIL_PASSWORD
+        text = f"📧 <code>{email_data['address']}</code>\n🔑 <code>{telegram_html(email_password)}</code>"
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton(get_text(lang, "btn_inbox"), callback_data=f"inbox_{email_index}", style="primary")],
             [InlineKeyboardButton(get_text(lang, "btn_delete"), callback_data=f"confirm_delete_{email_index}", style="danger")],
