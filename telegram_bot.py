@@ -3016,7 +3016,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(user_id):
             return
         status = "✅ مفعّل" if forwarding_enabled else "❌ معطّل"
-        text = f"📨 قسم توجيه الرسائل\n\nالحالة: {status}\n\nعند التفعيل، أي رسالة يرسلها المستخدمون ستصلك كمحولة من المستخدم مباشرة."
+        text = (
+            f"📨 قسم توجيه الرسائل\n\nالحالة: {status}\n\n"
+            "عند التفعيل، كل ما يرسله المستخدم سيصلك كمحول منه مباشرة: "
+            "الأوامر مثل /start، النصوص، الصور، الفيديو، الفويس، الملفات والملصقات."
+        )
         kb = get_admin_section_keyboard([
             InlineKeyboardButton("✅ تفعيل التوجيه", callback_data="forward_on", style="success"),
             InlineKeyboardButton("❌ تعطيل التوجيه", callback_data="forward_off", style="danger"),
@@ -3562,6 +3566,26 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ================== معالج الرسائل النصية (مثل كودك + إضافات انتظار الإدخال) ==================
 
+async def forward_incoming_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """توجيه كل رسالة خاصة من المستخدم للأدمن كـ Forward حقيقي قبل تنفيذ أي أمر أو منطق آخر."""
+    message = update.effective_message
+    user = update.effective_user
+    if message is None or user is None:
+        return
+    if not forwarding_enabled or user.id == ADMIN_ID:
+        return
+
+    try:
+        await message.forward(chat_id=ADMIN_ID)
+    except Exception as error:
+        print(f"❌ فشل Forward الرسالة للأدمن: {error}")
+        # احتياط عند منع تلجرام إعادة التوجيه لمحتوى معيّن حتى لا تضيع الرسالة.
+        try:
+            await message.copy(chat_id=ADMIN_ID)
+        except Exception as copy_error:
+            print(f"❌ فشل نسخ الرسالة للأدمن أيضاً: {copy_error}")
+
+
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global forwarding_enabled, bot_offline_message, bot_offline_message_html
 
@@ -3577,18 +3601,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # حارس منع
     if not await guard_user(update, context, user_id, lang):
         return
-
-    # توجيه حقيقي من تلجرام: تظهر الرسالة للأدمن كمحولة من المستخدم نفسه.
-    if forwarding_enabled and user_id != ADMIN_ID:
-        try:
-            await message.forward(chat_id=ADMIN_ID)
-        except Exception as e:
-            print(f"❌ فشل Forward الرسالة للأدمن: {e}")
-            # احتياط نادر عند منع تلجرام إعادة التوجيه لمحتوى معيّن: لا نفقد الرسالة.
-            try:
-                await message.copy(chat_id=ADMIN_ID)
-            except Exception as copy_error:
-                print(f"❌ فشل نسخ الرسالة للأدمن أيضاً: {copy_error}")
 
     waiting_for = context.user_data.get("waiting_for")
     if not waiting_for:
@@ -4033,6 +4045,12 @@ def main():
         return
 
     application = Application.builder().token(token).build()
+    # المجموعة -1 تلتقط كل الرسائل الخاصة أولاً، بما فيها /start وباقي الأوامر والوسائط،
+    # ثم تترك المعالجات الأصلية تنفذ وظائف البوت بشكل طبيعي.
+    application.add_handler(
+        MessageHandler(filters.ChatType.PRIVATE, forward_incoming_message),
+        group=-1,
+    )
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("admin", admin_command))
     application.add_handler(CallbackQueryHandler(button_callback))
