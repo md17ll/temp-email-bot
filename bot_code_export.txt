@@ -92,6 +92,10 @@ CREATE_EMAIL_COOLDOWN_SECONDS = 5
 INBOX_COOLDOWN_SECONDS = 3
 LEGACY_MAIL_PASSWORD = os.getenv("MAIL_TM_LEGACY_PASSWORD", "TempMail123")
 USER_ACTION_TIMESTAMPS = {}
+DEFAULT_SUBSCRIPTION_MESSAGE = (
+    "⚠️ يجب عليك الاشتراك في القنوات التالية لاستخدام البوت:\n\n"
+    "بعد الاشتراك في جميع القنوات اضغط: ✅ التحقق من الاشتراك"
+)
 
 
 def consume_action_cooldown(user_id: int, action: str, cooldown_seconds: int) -> int:
@@ -427,6 +431,19 @@ def get_last_seven_days_usage():
         return []
     finally:
         conn.close()
+
+
+def get_global_subscription_message() -> str:
+    """رسالة اشتراك إجبارية عامة واحدة لكل القنوات."""
+    value = get_setting("global_subscription_message", DEFAULT_SUBSCRIPTION_MESSAGE).strip()
+    return value or DEFAULT_SUBSCRIPTION_MESSAGE
+
+
+def set_global_subscription_message(message: str) -> bool:
+    value = str(message or "").strip()
+    if not value:
+        return False
+    return set_setting("global_subscription_message", value)
 
 
 def get_email_limit() -> int:
@@ -1153,31 +1170,29 @@ async def check_user_subscription_strict(user_id: int, context: ContextTypes.DEF
 
 
 def subscription_prompt(_lang: str, channels, message: str = ""):
-    """عرض كل القنوات الناقصة بأزرار انضمام منفصلة ثم زر تحقق واحد."""
+    """عرض الرسالة العامة مع القنوات الناقصة وأزرار الانضمام."""
     if isinstance(channels, str):
         channels = [{
             "channel_username": channels,
             "channel_title": channels,
-            "subscription_message": message,
         }]
     channels = list(channels or [])
 
-    text_lines = [
-        "⚠️ يجب عليك الاشتراك في القنوات التالية لاستخدام البوت:",
-        "",
-    ]
+    channel_lines = []
     for index, channel in enumerate(channels, start=1):
         username = str(channel.get("channel_username") or "").lstrip("@")
         title = str(channel.get("channel_title") or username)
-        text_lines.append(f"{index}. 📢 {title} — @{username}")
-        custom_message = str(channel.get("subscription_message") or "").strip()
-        if custom_message:
-            text_lines.append(f"   {custom_message}")
+        channel_lines.append(f"{index}. 📢 {title} — @{username}")
 
-    text_lines.extend([
-        "",
-        "بعد الاشتراك في جميع القنوات اضغط: ✅ التحقق من الاشتراك",
-    ])
+    channels_text = "\n".join(channel_lines)
+    global_message = get_global_subscription_message()
+    message_parts = global_message.split("\n\n", 1)
+    if len(message_parts) == 2:
+        text = f"{message_parts[0]}\n\n{channels_text}\n\n{message_parts[1]}"
+    elif channels_text:
+        text = f"{global_message}\n\n{channels_text}"
+    else:
+        text = global_message
 
     rows = []
     for channel in channels:
@@ -1198,7 +1213,7 @@ def subscription_prompt(_lang: str, channels, message: str = ""):
             style="success",
         )
     ])
-    return "\n".join(text_lines), InlineKeyboardMarkup(rows)
+    return text, InlineKeyboardMarkup(rows)
 
 # ================== mail.tm API ==================
 # ================== mail.tm API ==================
@@ -1922,7 +1937,12 @@ def get_channel_management_keyboard(_lang):
             "➕ إضافة قناة",
             callback_data="set_channel",
             style="success",
-        )
+        ),
+        InlineKeyboardButton(
+            "✏️ تعديل رسالة الاشتراك",
+            callback_data="edit_subscription_message",
+            style="primary",
+        ),
     ]]
 
     channel_buttons = []
@@ -2071,6 +2091,28 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception:
             pass
+        return
+
+    if data == "verify_subscription":
+        missing_channels = await get_missing_subscription_channels(user_id, context)
+        if missing_channels:
+            try:
+                await query.answer(
+                    "⚠️ يرجى الاشتراك بالقنوات لاستخدام البوت.",
+                    show_alert=True,
+                )
+            except Exception:
+                pass
+            return
+
+        try:
+            await query.answer("✅ تم التحقق من الاشتراك.", show_alert=False)
+        except Exception:
+            pass
+        for active_channel in get_channels(only_enabled=True):
+            await notify_admin_subscription(context, user_id, active_channel)
+        text = "✅ تم التحقق من اشتراكك في جميع القنوات بنجاح!\n\n" + build_main_menu_text(user_id)
+        await query.edit_message_text(text, reply_markup=get_main_menu_keyboard(lang, user_id))
         return
 
     try:
@@ -2409,19 +2451,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ✅ تحقق الاشتراك (زر)
-    if data == "verify_subscription":
-        missing_channels = await get_missing_subscription_channels(user_id, context)
-        if not missing_channels:
-            for active_channel in get_channels(only_enabled=True):
-                await notify_admin_subscription(context, user_id, active_channel)
-            text = "✅ تم التحقق من اشتراكك في جميع القنوات بنجاح!\n\n" + build_main_menu_text(user_id)
-            await query.edit_message_text(text, reply_markup=get_main_menu_keyboard(lang, user_id))
-        else:
-            text, kb = subscription_prompt(lang, missing_channels)
-            await query.edit_message_text(text, reply_markup=kb)
-        return
-
     # ================== لوحة الأدمن (القديمة) ==================
     # ================== لوحة الأدمن (القديمة) ==================
     if data == "admin_panel":
@@ -2508,6 +2537,27 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if data == "edit_subscription_message":
+        if not is_admin(user_id):
+            return
+        current_message = get_global_subscription_message()
+        context.user_data["waiting_for"] = "global_subscription_message"
+        await query.edit_message_text(
+            "✏️ تعديل رسالة الاشتراك الإجباري\n\n"
+            "الرسالة الحالية:\n\n"
+            f"{current_message}\n\n"
+            "أرسل الرسالة الجديدة الآن.\n\n"
+            "📌 قائمة القنوات ستظهر تلقائياً بين أول فقرة وباقي الرسالة.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    get_text(lang, "btn_back"),
+                    callback_data="channel_management",
+                    style="primary",
+                )
+            ]]),
+        )
+        return
+
     if data == "set_channel":
         if not is_admin(user_id):
             return
@@ -2548,7 +2598,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status = "✅ مفعّل" if channel_info.get("subscription_enabled") else "❌ معطّل"
         status_button = "❌ تعطيل الاشتراك" if channel_info.get("subscription_enabled") else "✅ تفعيل الاشتراك"
         status_style = "danger" if channel_info.get("subscription_enabled") else "success"
-        msg = channel_info.get("subscription_message") or "لا توجد رسالة خاصة"
         cid = channel_info.get("channel_id", "غير محدد")
         title = channel_info.get("channel_title", "غير محدد")
         username = channel_info["channel_username"]
@@ -2557,27 +2606,21 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📢 الاسم: <b>{telegram_html(title)}</b>\n"
             f"🔗 القناة: @{telegram_html(username)}\n"
             f"🆔 المعرّف: <code>{cid}</code>\n"
-            f"⚙️ الحالة: {status}\n"
-            f"📝 رسالة الاشتراك: {telegram_html(msg)}"
+            f"⚙️ الحالة: {status}"
         )
         kb = InlineKeyboardMarkup([
             [
-                InlineKeyboardButton(
-                    "📝 رسالة الاشتراك",
-                    callback_data=f"set_channel_message_{channel_db_id}",
-                    style="primary",
-                ),
                 InlineKeyboardButton(
                     status_button,
                     callback_data=f"toggle_subscription_{channel_db_id}",
                     style=status_style,
                 ),
+                InlineKeyboardButton(
+                    "🗑 حذف القناة",
+                    callback_data=f"delete_channel_{channel_db_id}",
+                    style="danger",
+                ),
             ],
-            [InlineKeyboardButton(
-                "🗑 حذف القناة",
-                callback_data=f"delete_channel_{channel_db_id}",
-                style="danger",
-            )],
             [InlineKeyboardButton(
                 get_text(lang, "btn_back"),
                 callback_data="channel_management",
@@ -2585,28 +2628,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )],
         ])
         await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
-        return
-
-    if re.fullmatch(r"set_channel_message_\d+", data):
-        if not is_admin(user_id):
-            return
-        channel_db_id = int(data.rsplit("_", 1)[1])
-        channel_info = get_channel_by_id(channel_db_id)
-        if not channel_info:
-            return
-        context.user_data["waiting_for"] = "channel_message"
-        context.user_data["channel_username"] = channel_info["channel_username"]
-        context.user_data["channel_manage_return_id"] = channel_db_id
-        await query.edit_message_text(
-            f"📝 أرسل رسالة الاشتراك الإجباري الخاصة بقناة @{channel_info['channel_username']}:",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton(
-                    get_text(lang, "btn_back"),
-                    callback_data=f"manage_channel_{channel_db_id}",
-                    style="primary",
-                )
-            ]]),
-        )
         return
 
     if re.fullmatch(r"delete_channel_\d+", data):
@@ -2653,32 +2674,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton(
                     get_text(lang, "btn_back"),
                     callback_data=f"manage_channel_{channel_db_id}",
-                    style="primary",
-                )
-            ]]),
-        )
-        return
-
-    # توافق مع أزرار رسائل الإدارة القديمة: تستهدف آخر قناة مضافة.
-    if data == "set_channel_message":
-        if not is_admin(user_id):
-            return
-        channel_info = get_channel_info(only_enabled=False)
-        if not channel_info:
-            await query.edit_message_text(
-                "❌ لا توجد قناة محددة",
-                reply_markup=get_channel_management_keyboard(lang),
-            )
-            return
-        context.user_data["waiting_for"] = "channel_message"
-        context.user_data["channel_username"] = channel_info["channel_username"]
-        context.user_data["channel_manage_return_id"] = channel_info["id"]
-        await query.edit_message_text(
-            "📝 أرسل رسالة الاشتراك الإجباري:",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton(
-                    get_text(lang, "btn_back"),
-                    callback_data=f"manage_channel_{channel_info['id']}",
                     style="primary",
                 )
             ]]),
@@ -3447,28 +3442,50 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # تعيين رسالة القناة
-    if waiting_for == "channel_message" and is_admin(user_id):
-        msg = update.message.text or ""
-        ch = context.user_data.get("channel_username")
-        return_id = context.user_data.get("channel_manage_return_id")
-        ok = bool(ch) and set_channel_message(ch, msg)
-        context.user_data["waiting_for"] = None
-        context.user_data["channel_username"] = None
-        context.user_data.pop("channel_manage_return_id", None)
-        back_callback = f"manage_channel_{return_id}" if return_id else "channel_management"
+    # تعديل رسالة الاشتراك الإجبارية العامة
+    if waiting_for == "global_subscription_message" and is_admin(user_id):
+        msg = (update.message.text or "").strip()
+        if not msg:
+            await update.message.reply_text(
+                "❌ الرسالة لا يمكن أن تكون فارغة.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        get_text(lang, "btn_back"),
+                        callback_data="channel_management",
+                        style="primary",
+                    )
+                ]]),
+            )
+            return
+        if len(msg) > 2500:
+            await update.message.reply_text(
+                "❌ الرسالة طويلة جداً. الحد الأقصى 2500 حرف.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        get_text(lang, "btn_back"),
+                        callback_data="channel_management",
+                        style="primary",
+                    )
+                ]]),
+            )
+            return
+
+        ok = set_global_subscription_message(msg)
+        if ok:
+            context.user_data["waiting_for"] = None
         await update.message.reply_text(
-            "✅ تم حفظ الرسالة" if ok else "❌ فشل حفظ الرسالة",
+            "✅ تم حفظ رسالة الاشتراك العامة." if ok else "❌ فشل حفظ الرسالة.",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton(
                     get_text(lang, "btn_back"),
-                    callback_data=back_callback,
+                    callback_data="channel_management",
                     style="primary",
                 )
             ]]),
         )
         return
 
+    # رسالة الإيقاف
     # رسالة الإيقاف
     if waiting_for == "offline_message" and is_admin(user_id):
         bot_offline_message = (update.message.text or "").strip()
