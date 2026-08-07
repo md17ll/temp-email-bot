@@ -20,6 +20,7 @@ import secrets
 import string
 import time
 import traceback
+from datetime import timedelta
 from html import escape, unescape
 
 import psycopg2
@@ -204,6 +205,16 @@ def init_database():
                 )
             """)
 
+            # إحصائيات الاستخدام اليومية.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS usage_daily_stats (
+                    stat_date DATE PRIMARY KEY DEFAULT CURRENT_DATE,
+                    new_users BIGINT NOT NULL DEFAULT 0,
+                    emails_created BIGINT NOT NULL DEFAULT 0,
+                    inbox_opens BIGINT NOT NULL DEFAULT 0
+                )
+            """)
+
             # الواجهة أصبحت عربية فقط؛ توحيد بيانات المستخدمين القديمة دون تغيير بنية الجدول.
             cur.execute("UPDATE bot_users SET language='ar' WHERE language IS DISTINCT FROM 'ar'")
 
@@ -313,6 +324,71 @@ def set_setting(key: str, value: str) -> bool:
         print(f"⚠️ خطأ في set_setting: {e}")
         conn.rollback()
         return False
+    finally:
+        conn.close()
+
+
+def increment_daily_stat(stat_name: str) -> bool:
+    """زيادة عداد يومي واحد بشكل ذري وآمن مع تعدد المستخدمين."""
+    allowed = {"new_users", "emails_created", "inbox_opens"}
+    if stat_name not in allowed:
+        return False
+
+    conn = get_db_connection()
+    if not conn:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                INSERT INTO usage_daily_stats(stat_date, {stat_name})
+                VALUES (CURRENT_DATE, 1)
+                ON CONFLICT(stat_date)
+                DO UPDATE SET {stat_name} = usage_daily_stats.{stat_name} + 1
+                """
+            )
+            conn.commit()
+            return True
+    except Exception as error:
+        print(f"⚠️ خطأ في تسجيل إحصائية {stat_name}: {error}")
+        conn.rollback()
+        return False
+    finally:
+        conn.close()
+
+
+def get_last_seven_days_usage():
+    """إرجاع آخر 7 أيام بما فيها الأيام التي لم يحدث فيها استخدام."""
+    conn = get_db_connection()
+    if not conn:
+        return []
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT CURRENT_DATE AS today")
+            today = cur.fetchone()["today"]
+            cur.execute("""
+                SELECT stat_date, new_users, emails_created, inbox_opens
+                FROM usage_daily_stats
+                WHERE stat_date BETWEEN CURRENT_DATE - INTERVAL '6 days' AND CURRENT_DATE
+                ORDER BY stat_date DESC
+            """)
+            rows = cur.fetchall()
+
+        by_date = {row["stat_date"]: row for row in rows}
+        result = []
+        for offset in range(7):
+            day = today - timedelta(days=offset)
+            row = by_date.get(day) or {}
+            result.append({
+                "stat_date": day,
+                "new_users": int(row.get("new_users") or 0),
+                "emails_created": int(row.get("emails_created") or 0),
+                "inbox_opens": int(row.get("inbox_opens") or 0),
+            })
+        return result
+    except Exception as error:
+        print(f"⚠️ خطأ في قراءة الإحصائيات اليومية: {error}")
+        return []
     finally:
         conn.close()
 
@@ -1513,6 +1589,7 @@ async def register_user_activity(context: ContextTypes.DEFAULT_TYPE, user) -> bo
     if user.id == ADMIN_ID and user.username and not get_admin_contact_username():
         set_setting("admin_contact_username", user.username)
     if is_new:
+        await asyncio.to_thread(increment_daily_stat, "new_users")
         await notify_admin_new_user(context, user)
     return is_new
 
@@ -1644,6 +1721,18 @@ def get_messages_keyboard(messages, email_index, _lang):
     return InlineKeyboardMarkup(keyboard)
 
 
+def get_admin_section_keyboard(buttons, back_callback="admin_panel"):
+    rows = [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
+    rows.append([
+        InlineKeyboardButton(
+            get_text("ar", "btn_back"),
+            callback_data=back_callback,
+            style="primary",
+        )
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
 def get_admin_panel_keyboard(_lang, user_id):
     keyboard = [
         [
@@ -1716,25 +1805,23 @@ def get_member_pages_keyboard(prefix: str, page: int, total_pages: int):
 
 def get_channel_management_keyboard(_lang):
     channel_info = get_channel_info(only_enabled=False)
-    keyboard = [
-        [InlineKeyboardButton("تعيين القناة", callback_data="set_channel", style="primary")],
-        [InlineKeyboardButton("تعيين رسالة الاشتراك", callback_data="set_channel_message", style="primary")],
+    buttons = [
+        InlineKeyboardButton("تعيين القناة", callback_data="set_channel", style="primary"),
+        InlineKeyboardButton("تعيين رسالة الاشتراك", callback_data="set_channel_message", style="primary"),
     ]
     if channel_info:
         status_icon = "✅" if channel_info.get("subscription_enabled") else "❌"
-        keyboard.append([
+        buttons.extend([
             InlineKeyboardButton(
                 f"إشعار الاشتراك: {status_icon}",
                 callback_data="toggle_subscription",
                 style="success" if channel_info.get("subscription_enabled") else "danger",
-            )
+            ),
+            InlineKeyboardButton("حذف القناة", callback_data="delete_channel", style="danger"),
         ])
-        keyboard.append([
-            InlineKeyboardButton("حذف القناة", callback_data="delete_channel", style="danger")
-        ])
-    keyboard.append([InlineKeyboardButton(get_text("ar", "btn_back"), callback_data="admin_panel")])
-    return InlineKeyboardMarkup(keyboard)
+    return get_admin_section_keyboard(buttons, "admin_panel")
 
+# ================== أدوات منع/سماح (جديد) ==================
 # ================== أدوات منع/سماح (جديد) ==================
 
 async def guard_user(update_or_query, context, user_id: int, lang: str) -> bool:
@@ -1983,6 +2070,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         email, token, password = await asyncio.to_thread(create_email)
         if email and token:
             add_user_email(user_id, email, token, password)
+            await asyncio.to_thread(increment_daily_stat, "emails_created")
             await query.edit_message_text(
                 get_text(lang, "email_created", email=telegram_html(email)),
                 reply_markup=InlineKeyboardMarkup([[
@@ -2032,6 +2120,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if email_index >= len(emails):
             return
         email_data = emails[email_index]
+        await asyncio.to_thread(increment_daily_stat, "inbox_opens")
         inbox_result = await asyncio.to_thread(check_user_inbox_detailed, user_id, email_index)
         messages = inbox_result.get("messages")
 
@@ -2343,16 +2432,109 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "section_stats":
         if not is_admin(user_id):
             return
+        kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "📊 الإحصائيات العامة",
+                    callback_data="stats_general",
+                    transparent=True,
+                ),
+                InlineKeyboardButton(
+                    "📈 إحصائيات الاستخدام اليومية",
+                    callback_data="stats_daily",
+                    transparent=True,
+                ),
+            ],
+            [InlineKeyboardButton(
+                get_text(lang, "btn_back"),
+                callback_data="admin_panel",
+                style="primary",
+            )],
+        ])
+        await query.edit_message_text(
+            "📊 قسم الإحصائيات\n\nاختر نوع الإحصائيات التي تريد عرضها:",
+            reply_markup=kb,
+        )
+        return
+
+    if data == "stats_general":
+        if not is_admin(user_id):
+            return
         total_users = len(user_database)
         total_emails = sum(len(u.get("emails", [])) for u in user_database.values())
         active_users = sum(1 for u in user_database.values() if len(u.get("emails", [])) > 0)
         text = (
-            "📊 قسم الإحصائيات\n\n"
+            "📊 الإحصائيات العامة\n\n"
             f"👥 إجمالي المستخدمين: {total_users}\n"
             f"📧 إجمالي الإيميلات: {total_emails}\n"
             f"🔄 المستخدمون النشطون: {active_users}\n"
         )
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="admin_panel")]]))
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    get_text(lang, "btn_back"),
+                    callback_data="section_stats",
+                    style="primary",
+                )
+            ]]),
+        )
+        return
+
+    if data == "stats_daily":
+        if not is_admin(user_id):
+            return
+        days = await asyncio.to_thread(get_last_seven_days_usage)
+        if not days:
+            text = "📈 إحصائيات الاستخدام اليومية\n\n❌ تعذر قراءة الإحصائيات حالياً."
+        else:
+            today = days[0]
+            labels = ["اليوم", "أمس"]
+            day_lines = []
+            for index, item in enumerate(days):
+                if index < len(labels):
+                    label = labels[index]
+                else:
+                    label = item["stat_date"].strftime("%Y-%m-%d")
+                day_lines.append(f"📅 {label}: {item['emails_created']} إيميل")
+
+            best_day = max(days, key=lambda item: item["emails_created"])
+            if best_day["stat_date"] == days[0]["stat_date"]:
+                best_label = "اليوم"
+            elif len(days) > 1 and best_day["stat_date"] == days[1]["stat_date"]:
+                best_label = "أمس"
+            else:
+                best_label = best_day["stat_date"].strftime("%Y-%m-%d")
+
+            text = (
+                "📈 إحصائيات الاستخدام اليومية\n\n"
+                "📅 إحصائيات اليوم:\n\n"
+                f"👤 المستخدمون الجدد: {today['new_users']}\n"
+                f"📧 الإيميلات المنشأة: {today['emails_created']}\n"
+                f"📥 مرات فتح صندوق الوارد: {today['inbox_opens']}\n\n"
+                "━━━━━━━━━━━━━━\n\n"
+                "📊 آخر 7 أيام:\n\n"
+                + "\n".join(day_lines)
+                + "\n\n"
+                "🏆 أعلى يوم استخدام خلال آخر 7 أيام:\n"
+                f"{best_label}: {best_day['emails_created']} إيميل"
+            )
+
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "🔄 تحديث الإحصائيات",
+                    callback_data="stats_daily",
+                    style="success",
+                )],
+                [InlineKeyboardButton(
+                    "🔙 رجوع إلى قسم الإحصائيات",
+                    callback_data="section_stats",
+                    style="primary",
+                )],
+            ]),
+        )
         return
 
     if data == "section_forward":
@@ -2360,11 +2542,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         status = "✅ مفعّل" if forwarding_enabled else "❌ معطّل"
         text = f"📨 قسم توجيه الرسائل\n\nالحالة: {status}\n\nعند التفعيل، أي رسالة يرسلها المستخدمون ستصلك مباشرة."
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ تفعيل التوجيه", callback_data="forward_on", style="success")],
-            [InlineKeyboardButton("❌ تعطيل التوجيه", callback_data="forward_off", style="danger")],
-            [InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="admin_panel")]
-        ])
+        kb = get_admin_section_keyboard([
+            InlineKeyboardButton("✅ تفعيل التوجيه", callback_data="forward_on", style="success"),
+            InlineKeyboardButton("❌ تعطيل التوجيه", callback_data="forward_off", style="danger"),
+        ], "admin_panel")
         await query.edit_message_text(text, reply_markup=kb)
         return
 
@@ -2392,11 +2573,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = f"⚙️ الإعدادات\n\n• حالة البوت: {status_icon} {status_text}\n"
         if not bot_active and bot_offline_message:
             text += f"• رسالة الإيقاف: {bot_offline_message[:80]}..."
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"🔄 حالة البوت: {status_icon}", callback_data="toggle_bot_status")],
-            [InlineKeyboardButton("✏️ رسالة الإيقاف", callback_data="set_offline_message")],
-            [InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="admin_panel")]
-        ])
+        kb = get_admin_section_keyboard([
+            InlineKeyboardButton(f"🔄 حالة البوت: {status_icon}", callback_data="toggle_bot_status"),
+            InlineKeyboardButton("✏️ رسالة الإيقاف", callback_data="set_offline_message"),
+        ], "admin_panel")
         await query.edit_message_text(text, reply_markup=kb)
         return
 
@@ -2419,11 +2599,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "section_broadcast":
         if not is_admin(user_id):
             return
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📨 إذاعة للكل", callback_data="broadcast_all", style="primary")],
-            [InlineKeyboardButton("👥 إذاعة للنشطين فقط", callback_data="broadcast_active", style="primary")],
-            [InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="admin_panel")]
-        ])
+        kb = get_admin_section_keyboard([
+            InlineKeyboardButton("📨 إذاعة للكل", callback_data="broadcast_all", style="primary"),
+            InlineKeyboardButton("👥 إذاعة للنشطين فقط", callback_data="broadcast_active", style="primary"),
+        ], "admin_panel")
         await query.edit_message_text("📢 قسم الإذاعة\n\nاختر نوع الإذاعة:", reply_markup=kb)
         return
 
@@ -2457,29 +2636,17 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             text += "لا توجد دومينات مضافة حالياً."
 
-        rows = [
-            [InlineKeyboardButton(
-                "➕ إضافة دومين",
-                callback_data="add_paid_domain",
-                style="success",
-            )],
+        buttons = [
+            InlineKeyboardButton("➕ إضافة دومين", callback_data="add_paid_domain", style="success"),
         ]
         if domains:
-            rows.append([
-                InlineKeyboardButton(
-                    "🗑️ حذف دومين",
-                    callback_data="delete_paid_domain",
-                    style="danger",
-                )
-            ])
-        rows.append([
-            InlineKeyboardButton(
-                get_text(lang, "btn_back"),
-                callback_data="admin_panel",
-                style="primary",
+            buttons.append(
+                InlineKeyboardButton("🗑️ حذف دومين", callback_data="delete_paid_domain", style="danger")
             )
-        ])
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows))
+        await query.edit_message_text(
+            text,
+            reply_markup=get_admin_section_keyboard(buttons, "admin_panel"),
+        )
         return
 
     if data == "add_paid_domain":
@@ -2515,25 +2682,17 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        rows = []
-        for index, domain in enumerate(domains):
-            rows.append([
-                InlineKeyboardButton(
-                    f"🗑️ @{domain}",
-                    callback_data=f"remove_paid_domain_{index}",
-                    style="danger",
-                )
-            ])
-        rows.append([
+        buttons = [
             InlineKeyboardButton(
-                get_text(lang, "btn_back"),
-                callback_data="section_paid_domains",
-                style="primary",
+                f"🗑️ @{domain}",
+                callback_data=f"remove_paid_domain_{index}",
+                style="danger",
             )
-        ])
+            for index, domain in enumerate(domains)
+        ]
         await query.edit_message_text(
             "🗑️ اختر الدومين الذي تريد حذفه:",
-            reply_markup=InlineKeyboardMarkup(rows),
+            reply_markup=get_admin_section_keyboard(buttons, "section_paid_domains"),
         )
         return
 
@@ -2566,27 +2725,30 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         current = "غير محدود" if limit == 0 else str(limit)
         contact_username = get_admin_contact_username()
         contact_text = f"@{contact_username}" if contact_username else "غير محدد"
-        rows = [
-            [InlineKeyboardButton("✏️ تحديد العدد", callback_data="set_email_limit", style="primary")],
+        buttons = [
+            InlineKeyboardButton("✏️ تحديد العدد", callback_data="set_email_limit", style="primary"),
         ]
         if user_id == ADMIN_ID:
-            rows.append([
+            buttons.append(
                 InlineKeyboardButton(
                     "🎯 تحديد حد عضو عبر ID",
                     callback_data="set_member_email_limit",
                     style="primary",
                 )
-            ])
-        rows.extend([
-            [InlineKeyboardButton("👤 إضافة يوزر التواصل", callback_data="set_admin_contact_username", transparent=True)],
-            [InlineKeyboardButton("♾️ إلغاء الحد", callback_data="clear_email_limit", style="danger")],
-            [InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="admin_panel")],
+            )
+        buttons.extend([
+            InlineKeyboardButton(
+                "👤 إضافة يوزر التواصل",
+                callback_data="set_admin_contact_username",
+                transparent=True,
+            ),
+            InlineKeyboardButton("♾️ إلغاء الحد", callback_data="clear_email_limit", style="danger"),
         ])
         await query.edit_message_text(
             "🔢 حد إنشاء الإيميلات\n\n"
             f"الحد الحالي لكل مستخدم: {current}\n"
             f"يوزر التواصل مع الأدمن: {contact_text}",
-            reply_markup=InlineKeyboardMarkup(rows),
+            reply_markup=get_admin_section_keyboard(buttons, "admin_panel"),
         )
         return
 
@@ -2655,23 +2817,24 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• الأعضاء غير النشطين: {inactive_users}\n"
             f"• إجمالي الإيميلات: {total_emails}\n"
         )
-        member_buttons = [
-            [InlineKeyboardButton("📋 قائمة كل الأعضاء", callback_data="users_list_all", style="primary")],
-            [InlineKeyboardButton("✅ الأعضاء النشطين", callback_data="users_list_active", style="success")],
-            [InlineKeyboardButton("🏆 الأكثر إيميلات", callback_data="users_list_top", style="primary")],
-            [InlineKeyboardButton("🔍 بحث عن عضو", callback_data="search_member", style="primary")],
+        buttons = [
+            InlineKeyboardButton("📋 قائمة كل الأعضاء", callback_data="users_list_all", style="primary"),
+            InlineKeyboardButton("✅ الأعضاء النشطين", callback_data="users_list_active", style="success"),
+            InlineKeyboardButton("🏆 الأكثر إيميلات", callback_data="users_list_top", style="primary"),
+            InlineKeyboardButton("🔍 بحث عن عضو", callback_data="search_member", style="primary"),
         ]
         if user_id == ADMIN_ID:
-            member_buttons.append([
+            buttons.append(
                 InlineKeyboardButton(
                     "🗑️ حذف إيميلات عضو",
                     callback_data="delete_user_emails",
                     style="danger",
                 )
-            ])
-        member_buttons.append([InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="admin_panel")])
-        kb = InlineKeyboardMarkup(member_buttons)
-        await query.edit_message_text(text, reply_markup=kb)
+            )
+        await query.edit_message_text(
+            text,
+            reply_markup=get_admin_section_keyboard(buttons, "admin_panel"),
+        )
         return
 
     if data == "users_list_all" or re.fullmatch(r"users_list_all_\d+", data):
@@ -2805,11 +2968,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             text += "لا يوجد مشرفون إضافيون حالياً\n"
 
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ إضافة مشرف", callback_data="add_admin", style="success")],
-            [InlineKeyboardButton("➖ إزالة مشرف", callback_data="remove_admin", style="danger")],
-            [InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="admin_panel")]
-        ])
+        kb = get_admin_section_keyboard([
+            InlineKeyboardButton("➕ إضافة مشرف", callback_data="add_admin", style="success"),
+            InlineKeyboardButton("➖ إزالة مشرف", callback_data="remove_admin", style="danger"),
+        ], "admin_panel")
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
         return
 
@@ -2829,12 +2991,20 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ لا يوجد مشرفون للإزالة",
                                           reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_admins")]]))
             return
-        kb_rows = []
+        buttons = []
         for a in admins:
             name = a.get("first_name") or str(a["telegram_id"])
-            kb_rows.append([InlineKeyboardButton(f"❌ {name}", callback_data=f"confirm_remove_admin_{a['telegram_id']}", style="danger")])
-        kb_rows.append([InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_admins")])
-        await query.edit_message_text("➖ اختر المشرف لإزالته:", reply_markup=InlineKeyboardMarkup(kb_rows))
+            buttons.append(
+                InlineKeyboardButton(
+                    f"❌ {name}",
+                    callback_data=f"confirm_remove_admin_{a['telegram_id']}",
+                    style="danger",
+                )
+            )
+        await query.edit_message_text(
+            "➖ اختر المشرف لإزالته:",
+            reply_markup=get_admin_section_keyboard(buttons, "section_admins"),
+        )
         return
 
     if data.startswith("confirm_remove_admin_"):
@@ -2853,11 +3023,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "section_ban":
         if not is_admin(user_id):
             return
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🛑 حظر مستخدم", callback_data="ban_user", style="danger")],
-            [InlineKeyboardButton("✅ فك حظر مستخدم", callback_data="unban_user", style="success")],
-            [InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="admin_panel")]
-        ])
+        kb = get_admin_section_keyboard([
+            InlineKeyboardButton("🛑 حظر مستخدم", callback_data="ban_user", style="danger"),
+            InlineKeyboardButton("✅ فك حظر مستخدم", callback_data="unban_user", style="success"),
+        ], "admin_panel")
         await query.edit_message_text("🛑 قسم الحظر\n\nاختر:", reply_markup=kb)
         return
 
@@ -2881,11 +3050,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(user_id):
             return
         current = get_setting("welcome_message", "")
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✏️ تعيين رسالة الترحيب", callback_data="set_welcome_message", style="success")],
-            [InlineKeyboardButton("🧹 حذف رسالة الترحيب", callback_data="clear_welcome_message", style="danger")],
-            [InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="admin_panel")]
-        ])
+        kb = get_admin_section_keyboard([
+            InlineKeyboardButton("✏️ تعيين رسالة الترحيب", callback_data="set_welcome_message", style="success"),
+            InlineKeyboardButton("🧹 حذف رسالة الترحيب", callback_data="clear_welcome_message", style="danger"),
+        ], "admin_panel")
         text = "👋 رسالة الترحيب الحالية:\n\n"
         text += (current if current else "— لا توجد رسالة —")
         await query.edit_message_text(text, reply_markup=kb)
