@@ -3052,7 +3052,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(user_id):
             return
         status = "✅ مفعّل" if forwarding_enabled else "❌ معطّل"
-        text = f"📨 قسم توجيه الرسائل\n\nالحالة: {status}\n\nعند التفعيل، أي رسالة يرسلها المستخدمون ستصلك مباشرة."
+        text = f"📨 قسم توجيه الرسائل\n\nالحالة: {status}\n\nعند التفعيل، أي رسالة يرسلها المستخدمون ستصلك كمحولة من المستخدم مباشرة."
         kb = get_admin_section_keyboard([
             InlineKeyboardButton("✅ تفعيل التوجيه", callback_data="forward_on", style="success"),
             InlineKeyboardButton("❌ تعطيل التوجيه", callback_data="forward_off", style="danger"),
@@ -3614,24 +3614,17 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await guard_user(update, context, user_id, lang):
         return
 
-    # توجيه رسائل المستخدمين للأدمن إذا مفعّل
+    # توجيه حقيقي من تلجرام: تظهر الرسالة للأدمن كمحولة من المستخدم نفسه.
     if forwarding_enabled and user_id != ADMIN_ID:
         try:
-            user_name = user.first_name or ""
-            if user.last_name:
-                user_name += f" {user.last_name}"
-            username = f"@{user.username}" if user.username else "لا يوجد"
-            forward_text = (
-                "📨 <b>رسالة جديدة من مستخدم:</b>\n\n"
-                f"👤 الاسم: {telegram_html(user_name)}\n"
-                f"🆔 المعرف: {telegram_html(username)}\n"
-                f"🔢 ID: <code>{user_id}</code>\n"
-                f"━━━━━━━━━━━━━━━\n"
-                f"💬 الرسالة:\n{message_custom_emoji_html(message)}"
-            )
-            await context.bot.send_message(chat_id=ADMIN_ID, text=forward_text, parse_mode="HTML")
+            await message.forward(chat_id=ADMIN_ID)
         except Exception as e:
-            print(f"❌ فشل توجيه الرسالة للأدمن: {e}")
+            print(f"❌ فشل Forward الرسالة للأدمن: {e}")
+            # احتياط نادر عند منع تلجرام إعادة التوجيه لمحتوى معيّن: لا نفقد الرسالة.
+            try:
+                await message.copy(chat_id=ADMIN_ID)
+            except Exception as copy_error:
+                print(f"❌ فشل نسخ الرسالة للأدمن أيضاً: {copy_error}")
 
     waiting_for = context.user_data.get("waiting_for")
     if not waiting_for:
@@ -4080,7 +4073,7 @@ def main():
     application.add_handler(CommandHandler("admin", admin_command))
     application.add_handler(CallbackQueryHandler(button_callback))
     application.add_handler(MessageHandler(
-        filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
+        filters.ChatType.PRIVATE,
         message_handler,
     ))
     application.add_error_handler(error_handler)
