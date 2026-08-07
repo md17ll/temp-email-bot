@@ -1,0 +1,33 @@
+name: Apply admin submenus and daily stats
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/apply_admin_submenus_and_daily_stats.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply and validate
+        run: |
+          python apply_admin_submenus_and_daily_stats.py
+          python -m py_compile telegram_bot.py
+          git diff --check
+          git diff --exit-code -- Procfile requirements.txt runtime.txt
+
+      - name: Commit result
+        run: |
+          rm -f apply_admin_submenus_and_daily_stats.py
+          rm -f .github/workflows/apply_admin_submenus_and_daily_stats.yml
+          git config user.name "md17ll"
+          git config user.email "actions@github.com"
+          git add -A
+          git commit -m "ترتيب أقسام الأدمن وإضافة إحصائيات الاستخدام اليومية"
+          git push origin main
