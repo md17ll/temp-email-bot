@@ -14,6 +14,7 @@
 """
 
 import asyncio
+import json
 import os
 import re
 import secrets
@@ -47,6 +48,7 @@ forwarding_enabled = False
 # حالة تشغيل البوت (الأدمن دائماً يستطيع الدخول)
 bot_active = True
 bot_offline_message = ""
+bot_offline_message_html = ""
 
 # 0 يعني غير محدود إلى أن يحدد الأدمن رقماً من لوحة التحكم
 DEFAULT_EMAIL_LIMIT = 0
@@ -332,6 +334,67 @@ def set_setting(key: str, value: str) -> bool:
         conn.close()
 
 
+
+def message_custom_emoji_html(message) -> str:
+    """تحويل نص رسالة تلجرام إلى HTML آمن مع إبقاء Custom Emoji في مكانه."""
+    text = str(getattr(message, "text", None) or "")
+    entities = [
+        entity
+        for entity in (getattr(message, "entities", None) or ())
+        if getattr(entity, "type", "") == "custom_emoji"
+        and getattr(entity, "custom_emoji_id", None)
+    ]
+    if not entities:
+        return escape(text, quote=False)
+
+    encoded = text.encode("utf-16-le")
+    parts = []
+    cursor = 0
+    for entity in sorted(entities, key=lambda item: int(item.offset)):
+        start = max(0, int(entity.offset))
+        end = max(start, start + int(entity.length))
+        if start < cursor:
+            continue
+        before = encoded[cursor * 2:start * 2].decode("utf-16-le")
+        emoji_text = encoded[start * 2:end * 2].decode("utf-16-le")
+        parts.append(escape(before, quote=False))
+        emoji_id = escape(str(entity.custom_emoji_id), quote=True)
+        parts.append(
+            f'<tg-emoji emoji-id="{emoji_id}">{escape(emoji_text, quote=False)}</tg-emoji>'
+        )
+        cursor = end
+
+    parts.append(encoded[cursor * 2:].decode("utf-16-le"))
+    # آخر جزء لم يمر عبر escape حتى الآن.
+    parts[-1] = escape(parts[-1], quote=False)
+    return "".join(parts)
+
+
+def save_rich_text_setting(key: str, message) -> bool:
+    """حفظ النص العادي ونسخته التي تحتوي معرفات الإيموجي المميز."""
+    text = str(getattr(message, "text", None) or "")
+    rich_html = message_custom_emoji_html(message)
+    if not set_setting(key, text):
+        return False
+    if not set_setting(f"{key}_rich_html", rich_html):
+        # منع بقاء نسخة Rich قديمة لا تطابق النص الجديد.
+        set_setting(f"{key}_rich_html", "")
+        return False
+    return True
+
+
+def get_rich_text_setting(key: str, default: str = ""):
+    """إرجاع النص العادي وHTML الآمن؛ متوافق مع الإعدادات القديمة."""
+    text = get_setting(key, default)
+    if not str(text or "").strip() and default:
+        text = default
+        return text, escape(text, quote=False)
+
+    rich_html = get_setting(f"{key}_rich_html", "")
+    if rich_html:
+        return text, rich_html
+    return text, escape(str(text or ""), quote=False)
+
 def increment_daily_stat(stat_name: str) -> bool:
     """زيادة عداد يومي واحد بشكل ذري وآمن مع تعدد المستخدمين."""
     allowed = {"new_users", "emails_created", "inbox_opens"}
@@ -399,15 +462,27 @@ def get_last_seven_days_usage():
 
 def get_global_subscription_message() -> str:
     """رسالة اشتراك إجبارية عامة واحدة لكل القنوات."""
-    value = get_setting("global_subscription_message", DEFAULT_SUBSCRIPTION_MESSAGE).strip()
-    return value or DEFAULT_SUBSCRIPTION_MESSAGE
+    value = get_setting("global_subscription_message", DEFAULT_SUBSCRIPTION_MESSAGE)
+    return value if str(value or "").strip() else DEFAULT_SUBSCRIPTION_MESSAGE
+
+
+def get_global_subscription_message_html() -> str:
+    value, rich_html = get_rich_text_setting(
+        "global_subscription_message",
+        DEFAULT_SUBSCRIPTION_MESSAGE,
+    )
+    if not str(value or "").strip():
+        return escape(DEFAULT_SUBSCRIPTION_MESSAGE, quote=False)
+    return rich_html
 
 
 def set_global_subscription_message(message: str) -> bool:
-    value = str(message or "").strip()
-    if not value:
+    value = str(message or "")
+    if not value.strip():
         return False
-    return set_setting("global_subscription_message", value)
+    if not set_setting("global_subscription_message", value):
+        return False
+    return set_setting("global_subscription_message_rich_html", "")
 
 
 def get_email_limit() -> int:
@@ -575,10 +650,20 @@ def build_main_menu_text(user_id: int) -> str:
     """دمج رسالة الترحيب مع القائمة الرئيسية في رسالة واحدة."""
     emails_count = len(get_user_emails(user_id))
     menu_text = get_text("ar", "main_menu", emails_count=emails_count)
-    welcome_message = get_setting("welcome_message", "").strip()
-    if welcome_message:
+    welcome_message = get_setting("welcome_message", "")
+    if str(welcome_message or "").strip():
         return f"{welcome_message}\n\n{menu_text}"
     return menu_text
+
+
+def build_main_menu_html(user_id: int) -> str:
+    """نسخة HTML من القائمة الرئيسية تحافظ على الإيموجي المميز برسالة الترحيب."""
+    emails_count = len(get_user_emails(user_id))
+    menu_text = get_text("ar", "main_menu", emails_count=emails_count)
+    welcome_text, welcome_html = get_rich_text_setting("welcome_message", "")
+    if str(welcome_text or "").strip():
+        return f"{welcome_html}\n\n{escape(menu_text, quote=False)}"
+    return escape(menu_text, quote=False)
 
 
 def telegram_html(value) -> str:
@@ -1083,6 +1168,37 @@ def toggle_subscription(channel_username):
         conn.close()
 
 
+def get_channel_subscription_stats():
+    """إحصائيات التحقق المسجلة لكل قناة اشتراك إجباري."""
+    channels = get_channels(only_enabled=False)
+    conn = get_db_connection()
+    if not conn:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT channel_key, COUNT(*)
+                FROM subscription_notifications
+                GROUP BY channel_key
+            """)
+            counts = {str(row[0]).lower(): int(row[1] or 0) for row in cur.fetchall()}
+
+        result = []
+        for channel in channels:
+            item = dict(channel)
+            channel_key = str(
+                item.get("channel_id") or item.get("channel_username") or ""
+            ).lower()
+            item["verified_count"] = counts.get(channel_key, 0)
+            result.append(item)
+        return result
+    except Exception as error:
+        print(f"⚠️ خطأ في إحصائيات قنوات الاشتراك: {error}")
+        return None
+    finally:
+        conn.close()
+
+
 # ================== اشتراك إجباري متعدد ==================
 
 async def get_missing_subscription_channels(user_id: int, context: ContextTypes.DEFAULT_TYPE):
@@ -1146,10 +1262,12 @@ def subscription_prompt(_lang: str, channels, message: str = ""):
     for index, channel in enumerate(channels, start=1):
         username = str(channel.get("channel_username") or "").lstrip("@")
         title = str(channel.get("channel_title") or username)
-        channel_lines.append(f"{index}. 📢 {title} — @{username}")
+        channel_lines.append(
+            f"{index}. 📢 {telegram_html(title)} — @{telegram_html(username)}"
+        )
 
     channels_text = "\n".join(channel_lines)
-    global_message = get_global_subscription_message()
+    global_message = get_global_subscription_message_html()
     message_parts = global_message.split("\n\n", 1)
     if len(message_parts) == 2:
         text = f"{message_parts[0]}\n\n{channels_text}\n\n{message_parts[1]}"
@@ -1908,6 +2026,13 @@ def get_channel_management_keyboard(_lang):
             style="primary",
         ),
     ]]
+    rows.append([
+        InlineKeyboardButton(
+            "📊 إحصائيات القنوات",
+            callback_data="channel_stats",
+            style="primary",
+        )
+    ])
 
     channel_buttons = []
     for channel in channels:
@@ -1958,13 +2083,20 @@ async def guard_user(update_or_query, context, user_id: int, lang: str) -> bool:
 
     # بوت مطفي؟
     if not bot_active and not admin_user:
-        text = f"⚠️ البوت متوقف مؤقتاً\n\n{bot_offline_message}" if bot_offline_message else "⚠️ البوت متوقف مؤقتاً."
+        if bot_offline_message:
+            prefix = "⚠️ البوت متوقف مؤقتاً\n\n"
+            text = prefix + bot_offline_message
+            rich_body = bot_offline_message_html or escape(bot_offline_message, quote=False)
+            rich_text = escape(prefix, quote=False) + rich_body
+        else:
+            text = "⚠️ البوت متوقف مؤقتاً."
+            rich_text = escape(text, quote=False)
         if hasattr(update_or_query, "message") and update_or_query.message:
-            await update_or_query.message.reply_text(text)
+            await update_or_query.message.reply_text(rich_text, parse_mode="HTML")
         else:
             try:
-                await update_or_query.edit_message_text(text)
-            except:
+                await update_or_query.edit_message_text(rich_text, parse_mode="HTML")
+            except Exception:
                 pass
         return False
 
@@ -1975,10 +2107,18 @@ async def guard_user(update_or_query, context, user_id: int, lang: str) -> bool:
         if missing_channels:
             text, kb = subscription_prompt(lang, missing_channels)
             if hasattr(update_or_query, "message") and update_or_query.message:
-                await update_or_query.message.reply_text(text, reply_markup=kb)
+                await update_or_query.message.reply_text(
+                    text,
+                    reply_markup=kb,
+                    parse_mode="HTML",
+                )
             else:
                 try:
-                    await update_or_query.edit_message_text(text, reply_markup=kb)
+                    await update_or_query.edit_message_text(
+                        text,
+                        reply_markup=kb,
+                        parse_mode="HTML",
+                    )
                 except Exception:
                     pass
             return False
@@ -2005,8 +2145,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await message.reply_text(
-        build_main_menu_text(user_id),
+        build_main_menu_html(user_id),
         reply_markup=get_main_menu_keyboard(lang, user_id),
+        parse_mode="HTML",
     )
 
 
@@ -2075,8 +2216,15 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         for active_channel in get_channels(only_enabled=True):
             await notify_admin_subscription(context, user_id, active_channel)
-        text = "✅ تم التحقق من اشتراكك في جميع القنوات بنجاح!\n\n" + build_main_menu_text(user_id)
-        await query.edit_message_text(text, reply_markup=get_main_menu_keyboard(lang, user_id))
+        text = (
+            "✅ تم التحقق من اشتراكك في جميع القنوات بنجاح!\n\n"
+            + build_main_menu_html(user_id)
+        )
+        await query.edit_message_text(
+            text,
+            reply_markup=get_main_menu_keyboard(lang, user_id),
+            parse_mode="HTML",
+        )
         return
 
     try:
@@ -2090,8 +2238,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # رجوع للقائمة
     if data == "back_to_menu":
         await query.edit_message_text(
-            build_main_menu_text(user_id),
+            build_main_menu_html(user_id),
             reply_markup=get_main_menu_keyboard(lang, user_id),
+            parse_mode="HTML",
         )
         return
 
@@ -2501,17 +2650,89 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+
+    if data == "channel_stats":
+        if not is_admin(user_id):
+            return
+
+        channel_stats = await asyncio.to_thread(get_channel_subscription_stats)
+        if channel_stats is None:
+            await query.edit_message_text(
+                "❌ تعذر تحميل إحصائيات القنوات حالياً.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        get_text(lang, "btn_back"),
+                        callback_data="channel_management",
+                        style="primary",
+                    )
+                ]]),
+            )
+            return
+
+        enabled_count = sum(1 for item in channel_stats if item.get("subscription_enabled"))
+        disabled_count = len(channel_stats) - enabled_count
+        total_verified = sum(int(item.get("verified_count") or 0) for item in channel_stats)
+        text = (
+            "📊 إحصائيات قنوات الاشتراك\n\n"
+            f"📢 إجمالي القنوات: {len(channel_stats)}\n"
+            f"✅ المفعّلة: {enabled_count}\n"
+            f"❌ المعطّلة: {disabled_count}\n\n"
+            f"👥 إجمالي عمليات الاشتراك التي تحقق منها البوت: {total_verified}\n"
+        )
+
+        if channel_stats:
+            text += "\n━━━━━━━━━━━━━━\n"
+            shown = 0
+            for item in channel_stats:
+                title = item.get("channel_title") or item.get("channel_username") or "غير محدد"
+                username = str(item.get("channel_username") or "").lstrip("@")
+                status = "✅ مفعّلة" if item.get("subscription_enabled") else "❌ معطّلة"
+                verified_count = int(item.get("verified_count") or 0)
+                block = (
+                    f"\n📢 <b>{telegram_html(title)}</b>\n"
+                    f"🔗 @{telegram_html(username)}\n"
+                    f"⚙️ الحالة: {status}\n"
+                    f"👥 تحقق البوت من اشتراك: {verified_count} عضو\n"
+                )
+                if len(text) + len(block) > 3800:
+                    remaining = len(channel_stats) - shown
+                    text += f"\n… ويوجد {remaining} قناة إضافية."
+                    break
+                text += block
+                shown += 1
+        else:
+            text += "\nلا توجد قنوات مضافة حالياً."
+
+        await query.edit_message_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "🔄 تحديث الإحصائيات",
+                    callback_data="channel_stats",
+                    style="success",
+                )],
+                [InlineKeyboardButton(
+                    get_text(lang, "btn_back"),
+                    callback_data="channel_management",
+                    style="primary",
+                )],
+            ]),
+        )
+        return
+
     if data == "edit_subscription_message":
         if not is_admin(user_id):
             return
-        current_message = get_global_subscription_message()
+        current_message = get_global_subscription_message_html()
         context.user_data["waiting_for"] = "global_subscription_message"
         await query.edit_message_text(
             "✏️ تعديل رسالة الاشتراك الإجباري\n\n"
             "الرسالة الحالية:\n\n"
             f"{current_message}\n\n"
             "أرسل الرسالة الجديدة الآن.\n\n"
-            "📌 قائمة القنوات ستظهر تلقائياً بين أول فقرة وباقي الرسالة.",
+            "📌 قائمة القنوات ستظهر تلقائياً بين أول فقرة وباقي الرسالة.\n"
+            "🌟 الإيموجي المميز يُحفظ تلقائياً عند إرساله داخل النص.",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton(
                     get_text(lang, "btn_back"),
@@ -2519,6 +2740,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     style="primary",
                 )
             ]]),
+            parse_mode="HTML",
         )
         return
 
@@ -3302,14 +3524,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "section_welcome":
         if not is_admin(user_id):
             return
-        current = get_setting("welcome_message", "")
+        current, current_html = get_rich_text_setting("welcome_message", "")
         kb = get_admin_section_keyboard([
             InlineKeyboardButton("✏️ تعيين رسالة الترحيب", callback_data="set_welcome_message", style="success"),
             InlineKeyboardButton("🧹 حذف رسالة الترحيب", callback_data="clear_welcome_message", style="danger"),
         ], "admin_panel")
         text = "👋 رسالة الترحيب الحالية:\n\n"
-        text += (current if current else "— لا توجد رسالة —")
-        await query.edit_message_text(text, reply_markup=kb)
+        text += (current_html if str(current or "").strip() else "— لا توجد رسالة —")
+        await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
         return
 
     if data == "set_welcome_message":
@@ -3324,6 +3546,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(user_id):
             return
         set_setting("welcome_message", "")
+        set_setting("welcome_message_rich_html", "")
         await query.edit_message_text("✅ تم حذف رسالة الترحيب",
                                       reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_welcome")]]))
         return
@@ -3340,7 +3563,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================== معالج الرسائل النصية (مثل كودك + إضافات انتظار الإدخال) ==================
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global forwarding_enabled, bot_offline_message
+    global forwarding_enabled, bot_offline_message, bot_offline_message_html
 
     user = update.effective_user
     message = update.effective_message
@@ -3368,7 +3591,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🆔 المعرف: {telegram_html(username)}\n"
                 f"🔢 ID: <code>{user_id}</code>\n"
                 f"━━━━━━━━━━━━━━━\n"
-                f"💬 الرسالة:\n{telegram_html(message.text)}"
+                f"💬 الرسالة:\n{message_custom_emoji_html(message)}"
             )
             await context.bot.send_message(chat_id=ADMIN_ID, text=forward_text, parse_mode="HTML")
         except Exception as e:
@@ -3408,8 +3631,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # تعديل رسالة الاشتراك الإجبارية العامة
     if waiting_for == "global_subscription_message" and is_admin(user_id):
-        msg = (update.message.text or "").strip()
-        if not msg:
+        msg = update.message.text or ""
+        if not msg.strip():
             await update.message.reply_text(
                 "❌ الرسالة لا يمكن أن تكون فارغة.",
                 reply_markup=InlineKeyboardMarkup([[
@@ -3434,7 +3657,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        ok = set_global_subscription_message(msg)
+        ok = save_rich_text_setting("global_subscription_message", message)
         if ok:
             context.user_data["waiting_for"] = None
         await update.message.reply_text(
@@ -3452,7 +3675,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # رسالة الإيقاف
     # رسالة الإيقاف
     if waiting_for == "offline_message" and is_admin(user_id):
-        bot_offline_message = (update.message.text or "").strip()
+        bot_offline_message = update.message.text or ""
+        bot_offline_message_html = message_custom_emoji_html(message)
         context.user_data["waiting_for"] = None
         await update.message.reply_text("✅ تم حفظ رسالة الإيقاف",
                                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_settings")]]))
@@ -3462,12 +3686,17 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if waiting_for == "broadcast_all" and is_admin(user_id):
         context.user_data["waiting_for"] = None
         msg = update.message.text or ""
+        msg_html = message_custom_emoji_html(message)
         wait_msg = await update.message.reply_text("⏳ جاري إرسال الإذاعة...")
         okc = 0
         fail = 0
         for uid in list(user_database.keys()):
             try:
-                await context.bot.send_message(chat_id=int(uid), text=f"📢 رسالة من الإدارة:\n\n{msg}")
+                await context.bot.send_message(
+                    chat_id=int(uid),
+                    text=f"📢 رسالة من الإدارة:\n\n{msg_html}",
+                    parse_mode="HTML",
+                )
                 okc += 1
             except:
                 fail += 1
@@ -3483,13 +3712,18 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if waiting_for == "broadcast_active" and is_admin(user_id):
         context.user_data["waiting_for"] = None
         msg = update.message.text or ""
+        msg_html = message_custom_emoji_html(message)
         wait_msg = await update.message.reply_text("⏳ جاري إرسال الإذاعة للنشطين...")
         okc = 0
         fail = 0
         for uid, info in user_database.items():
             if len(info.get("emails", [])) > 0:
                 try:
-                    await context.bot.send_message(chat_id=int(uid), text=f"📢 رسالة من الإدارة:\n\n{msg}")
+                    await context.bot.send_message(
+                        chat_id=int(uid),
+                        text=f"📢 رسالة من الإدارة:\n\n{msg_html}",
+                        parse_mode="HTML",
+                    )
                     okc += 1
                 except:
                     fail += 1
@@ -3742,11 +3976,14 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ✅ تعيين رسالة الترحيب (جديد)
     if waiting_for == "welcome_message" and is_admin(user_id):
-        msg = (update.message.text or "").strip()
-        set_setting("welcome_message", msg)
-        context.user_data["waiting_for"] = None
-        await update.message.reply_text("✅ تم حفظ رسالة الترحيب",
-                                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_welcome")]]))
+        msg = update.message.text or ""
+        ok = save_rich_text_setting("welcome_message", message)
+        if ok:
+            context.user_data["waiting_for"] = None
+        await update.message.reply_text(
+            "✅ تم حفظ رسالة الترحيب والإيموجيات المميزة" if ok else "❌ فشل حفظ رسالة الترحيب",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_welcome")]]),
+        )
         return
 
     # ✅ حظر مستخدم (جديد)
