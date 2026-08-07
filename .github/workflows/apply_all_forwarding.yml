@@ -1,0 +1,42 @@
+name: Apply all Telegram forwarding
+
+on:
+  push:
+    paths:
+      - 'apply_all_forwarding.py'
+      - '.github/workflows/apply_all_forwarding.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Apply patch
+        run: python apply_all_forwarding.py
+
+      - name: Validate syntax without creating cache
+        run: |
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+          ast.parse(Path('telegram_bot.py').read_text(encoding='utf-8'))
+          print('syntax ok')
+          PY
+          git diff --check
+
+      - name: Commit source and cleanup helper files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add telegram_bot.py bot_code_export.txt
+          git rm -f apply_all_forwarding.py .github/workflows/apply_all_forwarding.yml
+          git commit -m "توجيه كل رسائل المستخدمين كتحويل حقيقي"
+          git push origin main
