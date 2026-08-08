@@ -137,7 +137,7 @@ end = text.find('    # إيميلاتي\n', start)
 if start == -1 or end == -1:
     raise SystemExit("create-email callback block not found")
 
-new_block = '''    # إنشاء إيميل: يختار المستخدم بين الإنشاء السريع أو دومين مجاني محدد.
+new_block = r'''    # إنشاء إيميل: يختار المستخدم بين الإنشاء السريع أو دومين مجاني محدد.
     if data == "create_email":
         current_count = len(get_user_emails(user_id))
         email_limit = get_effective_email_limit(user_id)
@@ -286,7 +286,7 @@ new_block = '''    # إنشاء إيميل: يختار المستخدم بين �
         )
         return
 
-    if re.fullmatch(r"free_domain_\\d+", data):
+    if re.fullmatch(r"free_domain_\d+", data):
         domain_index = int(data.rsplit("_", 1)[1])
         domains = list(context.user_data.get("free_domains") or [])
         if domain_index >= len(domains):
