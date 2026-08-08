@@ -57,6 +57,7 @@ BOT_STARTED_AT = time.time()
 CREATE_EMAIL_COOLDOWN_SECONDS = 5
 INBOX_COOLDOWN_SECONDS = 3
 LEGACY_MAIL_PASSWORD = os.getenv("MAIL_TM_LEGACY_PASSWORD", "TempMail123")
+FIXED_MAIL_PASSWORD = "TempMail123"
 USER_ACTION_TIMESTAMPS = {}
 DEFAULT_SUBSCRIPTION_MESSAGE = (
     "⚠️ يجب عليك الاشتراك في القنوات التالية لاستخدام البوت:\n\n"
@@ -1373,13 +1374,12 @@ def create_email():
         domains = list(domains)
         secrets.SystemRandom().shuffle(domains)
         username_chars = string.ascii_lowercase + string.digits
-        password_chars = string.ascii_letters + string.digits
 
         for domain in domains:
             for _ in range(2):
                 username = "".join(secrets.choice(username_chars) for _ in range(10))
                 email_address = f"{username}@{domain}"
-                password = "".join(secrets.choice(password_chars) for _ in range(20))
+                password = FIXED_MAIL_PASSWORD
 
                 response = mail_request(
                     "POST",
@@ -1437,12 +1437,11 @@ def create_email_with_domain(domain):
             return None, None, None
 
         username_chars = string.ascii_lowercase + string.digits
-        password_chars = string.ascii_letters + string.digits
 
         for _ in range(2):
             username = "".join(secrets.choice(username_chars) for _ in range(10))
             email_address = f"{username}@{domain}"
-            password = "".join(secrets.choice(password_chars) for _ in range(20))
+            password = FIXED_MAIL_PASSWORD
 
             response = mail_request(
                 "POST",
@@ -1762,6 +1761,7 @@ def get_message_text(full: dict) -> str:
 # ================== بيانات المستخدمين ==================
 
 init_database()
+forwarding_enabled = get_setting("forwarding_enabled", "0") == "1"
 user_database = load_user_data()
 
 
@@ -1942,7 +1942,6 @@ def get_main_menu_keyboard(_lang, user_id):
             InlineKeyboardButton(get_text("ar", "btn_my_emails"), callback_data="my_emails", style="primary"),
             InlineKeyboardButton(get_text("ar", "btn_inbox"), callback_data="select_inbox", style="primary"),
         ],
-        [InlineKeyboardButton("🌐 تغيير الدومين", callback_data="change_domain", style="primary")],
         [InlineKeyboardButton("⚙️ إدارة إيميلاتك", callback_data="manage_emails", style="danger")],
     ]
     if is_admin(user_id):
@@ -2476,11 +2475,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         domains = get_paid_domains()
         if not domains:
             await query.edit_message_text(
-                "🌐 لا توجد دومينات مدفوعة متاحة حالياً.",
+                "💎 لا توجد دومينات مدفوعة متاحة حالياً.",
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton(
                         get_text(lang, "btn_back"),
-                        callback_data="back_to_menu",
+                        callback_data="create_email",
                         style="primary",
                     )
                 ]]),
@@ -2499,12 +2498,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rows.append([
             InlineKeyboardButton(
                 get_text(lang, "btn_back"),
-                callback_data="back_to_menu",
+                callback_data="create_email",
                 style="primary",
             )
         ])
         await query.edit_message_text(
-            "🌐 اختر الدومين الذي تريد استخدامه:",
+            "💎 الدومينات المدفوعة\n\nاختر أحد الدومينات المدفوعة المتاحة:",
             reply_markup=InlineKeyboardMarkup(rows),
         )
         return
@@ -2588,7 +2587,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "الدومينات المجانية المتاحة تلقائياً.\n\n"
             "🌐 اختيار الدومين:\n"
             "اختر بنفسك أحد الدومينات المجانية المتاحة\n"
-            "لإنشاء الإيميل عليه."
+            "لإنشاء الإيميل عليه.\n\n"
+            "💎 الدومينات المدفوعة:\n"
+            "استعرض الدومينات المدفوعة المتوفرة واختر\n"
+            "الدومين الذي ترغب باستخدامه."
         )
         await query.edit_message_text(
             text,
@@ -2605,6 +2607,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         style="primary",
                     ),
                 ],
+                [InlineKeyboardButton(
+                    "💎 الدومينات المدفوعة",
+                    callback_data="change_domain",
+                    style="primary",
+                )],
                 [InlineKeyboardButton(
                     get_text(lang, "btn_back"),
                     callback_data="back_to_menu",
@@ -3631,6 +3638,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "forward_on":
         if not is_admin(user_id):
             return
+        if not set_setting("forwarding_enabled", "1"):
+            await query.edit_message_text(
+                "❌ تعذر حفظ حالة التوجيه في قاعدة البيانات.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_forward")]]),
+            )
+            return
         forwarding_enabled = True
         await query.edit_message_text("✅ تم تفعيل توجيه الرسائل!",
                                       reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_forward")]]))
@@ -3638,6 +3651,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "forward_off":
         if not is_admin(user_id):
+            return
+        if not set_setting("forwarding_enabled", "0"):
+            await query.edit_message_text(
+                "❌ تعذر حفظ حالة التوجيه في قاعدة البيانات.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="section_forward")]]),
+            )
             return
         forwarding_enabled = False
         await query.edit_message_text("❌ تم تعطيل توجيه الرسائل!",
@@ -4038,12 +4057,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         email_data = emails[email_index]
         address = str(email_data.get("address") or "غير معروف")
-        email_password = email_data.get("password") or LEGACY_MAIL_PASSWORD
         text = (
             "📧 بيانات إيميل العضو\n\n"
             f"🔢 ID العضو: <code>{target_id}</code>\n"
-            f"📧 الإيميل: <code>{telegram_html(address)}</code>\n"
-            f"🔑 كلمة المرور: <code>{telegram_html(email_password)}</code>"
+            f"📧 الإيميل: <code>{telegram_html(address)}</code>"
         )
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton(
