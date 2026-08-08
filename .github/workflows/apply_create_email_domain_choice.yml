@@ -34,3 +34,5 @@ jobs:
           git rm .github/workflows/apply_create_email_domain_choice.yml
           git commit -m "إضافة اختيار الدومين المجاني عند إنشاء الإيميل"
           git push
+
+# rerun after patch-script fix
