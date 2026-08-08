@@ -1424,6 +1424,63 @@ def create_email():
         return None, None, None
 
 
+def create_email_with_domain(domain):
+    """إنشاء بريد على دومين مجاني محدد من قائمة mail.tm المتاحة حالياً."""
+    try:
+        domain = str(domain or "").strip().lower().lstrip("@")
+        if not domain:
+            return None, None, None
+
+        available_domains = get_available_domains()
+        if domain not in available_domains:
+            print(f"⚠️ الدومين @{domain} لم يعد متاحاً ضمن الدومينات المجانية العامة")
+            return None, None, None
+
+        username_chars = string.ascii_lowercase + string.digits
+        password_chars = string.ascii_letters + string.digits
+
+        for _ in range(2):
+            username = "".join(secrets.choice(username_chars) for _ in range(10))
+            email_address = f"{username}@{domain}"
+            password = "".join(secrets.choice(password_chars) for _ in range(20))
+
+            response = mail_request(
+                "POST",
+                "/accounts",
+                json={"address": email_address, "password": password},
+            )
+            if response is None:
+                break
+            if response.status_code == 422:
+                continue
+            if response.status_code != 201:
+                print(f"⚠️ فشل إنشاء حساب على @{domain}: HTTP {response.status_code}")
+                break
+
+            token_response = mail_request(
+                "POST",
+                "/token",
+                json={"address": email_address, "password": password},
+            )
+            if token_response is None or token_response.status_code != 200:
+                status = token_response.status_code if token_response is not None else "network"
+                print(f"⚠️ فشل جلب توكن البريد {email_address}: {status}")
+                break
+
+            try:
+                token = token_response.json().get("token")
+            except (ValueError, AttributeError):
+                token = None
+            if token:
+                return email_address, token, password
+            break
+
+        return None, None, None
+    except Exception as error:
+        print(f"❌ create_email_with_domain: {type(error).__name__}: {error}")
+        return None, None, None
+
+
 def refresh_email_token_data(email_data):
     """تجديد توكن بريد واحد من العنوان وكلمة المرور المحفوظة."""
     if not isinstance(email_data, dict):
@@ -1895,6 +1952,38 @@ def get_main_menu_keyboard(_lang, user_id):
     return InlineKeyboardMarkup(keyboard)
 
 
+def get_free_domains_keyboard(domains):
+    """عرض الدومينات المجانية النشطة التي تم جلبها مباشرة من mail.tm."""
+    rows = []
+    for index, domain in enumerate(domains):
+        display_domain = str(domain)
+        if len(display_domain) > 40:
+            display_domain = display_domain[:37] + "..."
+        rows.append([
+            InlineKeyboardButton(
+                f"@{display_domain}",
+                callback_data=f"free_domain_{index}",
+                style="primary",
+            )
+        ])
+
+    rows.append([
+        InlineKeyboardButton(
+            "🔄 تحديث الدومينات",
+            callback_data="refresh_free_domains",
+            style="success",
+        )
+    ])
+    rows.append([
+        InlineKeyboardButton(
+            get_text("ar", "btn_back"),
+            callback_data="create_email",
+            style="primary",
+        )
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
 def get_email_list_keyboard(emails, action_prefix, _lang):
     keyboard = []
     for index, email_info in enumerate(emails):
@@ -2309,9 +2398,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = "ar"
 
     cooldown_remaining = 0
-    if data == "create_email":
+    if data == "create_email_fast" or re.fullmatch(r"free_domain_\d+", data):
         cooldown_remaining = consume_action_cooldown(
             user_id, "create_email", CREATE_EMAIL_COOLDOWN_SECONDS
+        )
+    elif data == "refresh_free_domains":
+        cooldown_remaining = consume_action_cooldown(
+            user_id, "free_domains", INBOX_COOLDOWN_SECONDS
         )
     elif re.fullmatch(r"inbox_\d+", data):
         cooldown_remaining = consume_action_cooldown(
@@ -2458,7 +2551,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # إنشاء إيميل
+    # إنشاء إيميل: يختار المستخدم بين الإنشاء السريع أو دومين مجاني محدد.
     if data == "create_email":
         current_count = len(get_user_emails(user_id))
         email_limit = get_effective_email_limit(user_id)
@@ -2474,7 +2567,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 ])
             rows.append([
-                InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="back_to_menu")
+                InlineKeyboardButton(
+                    get_text(lang, "btn_back"),
+                    callback_data="back_to_menu",
+                    style="primary",
+                )
             ])
             await query.edit_message_text(
                 "⚠️ لقد وصلت إلى الحد المسموح لإنشاء الإيميلات.\n\n"
@@ -2483,6 +2580,60 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        text = (
+            "✨ إنشاء إيميل جديد\n\n"
+            "من هنا يمكنك اختيار طريقة إنشاء بريدك الإلكتروني.\n\n"
+            "🎲 الإنشاء السريع:\n"
+            "ينشئ لك البوت إيميل جديد مباشرة ويختار أحد\n"
+            "الدومينات المجانية المتاحة تلقائياً.\n\n"
+            "🌐 اختيار الدومين:\n"
+            "اختر بنفسك أحد الدومينات المجانية المتاحة\n"
+            "لإنشاء الإيميل عليه."
+        )
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "🎲 إنشاء سريع",
+                        callback_data="create_email_fast",
+                        style="success",
+                    ),
+                    InlineKeyboardButton(
+                        "🌐 اختيار الدومين",
+                        callback_data="select_free_domain",
+                        style="primary",
+                    ),
+                ],
+                [InlineKeyboardButton(
+                    get_text(lang, "btn_back"),
+                    callback_data="back_to_menu",
+                    style="primary",
+                )],
+            ]),
+        )
+        return
+
+    if data == "create_email_fast":
+        current_count = len(get_user_emails(user_id))
+        email_limit = get_effective_email_limit(user_id)
+        if (not is_admin(user_id)) and email_limit > 0 and current_count >= email_limit:
+            await query.edit_message_text(
+                "⚠️ لقد وصلت إلى الحد المسموح لإنشاء الإيميلات.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        get_text(lang, "btn_back"),
+                        callback_data="back_to_menu",
+                        style="primary",
+                    )
+                ]]),
+            )
+            return
+
+        await query.edit_message_text(
+            "🎲 إنشاء سريع\n\n"
+            "جاري إنشاء إيميل جديد باستخدام أحد الدومينات المجانية المتاحة..."
+        )
         email, token, password = await asyncio.to_thread(create_email)
         if email and token:
             add_user_email(user_id, email, token, password)
@@ -2490,7 +2641,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(
                 get_text(lang, "email_created", email=telegram_html(email)),
                 reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="back_to_menu")
+                    InlineKeyboardButton(
+                        get_text(lang, "btn_back"),
+                        callback_data="back_to_menu",
+                        style="primary",
+                    )
                 ]]),
                 parse_mode="HTML",
             )
@@ -2498,8 +2653,132 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(
                 get_text(lang, "error_create_email"),
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(get_text(lang, "btn_create"), callback_data="create_email", style="success")],
-                    [InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="back_to_menu")],
+                    [InlineKeyboardButton(
+                        "🔄 إعادة المحاولة",
+                        callback_data="create_email_fast",
+                        style="success",
+                    )],
+                    [InlineKeyboardButton(
+                        get_text(lang, "btn_back"),
+                        callback_data="create_email",
+                        style="primary",
+                    )],
+                ]),
+            )
+        return
+
+    if data in ("select_free_domain", "refresh_free_domains"):
+        domains = await asyncio.to_thread(get_available_domains)
+        if not domains:
+            context.user_data.pop("free_domains", None)
+            await query.edit_message_text(
+                "🌐 اختيار الدومين\n\n"
+                "تعذر تحميل الدومينات المجانية المتاحة حالياً.\n"
+                "حاول التحديث بعد قليل.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        "🔄 تحديث الدومينات",
+                        callback_data="refresh_free_domains",
+                        style="success",
+                    )],
+                    [InlineKeyboardButton(
+                        get_text(lang, "btn_back"),
+                        callback_data="create_email",
+                        style="primary",
+                    )],
+                ]),
+            )
+            return
+
+        context.user_data["free_domains"] = list(domains)
+        await query.edit_message_text(
+            "🌐 اختيار الدومين\n\n"
+            "اختر أحد الدومينات المجانية المتاحة أدناه.\n"
+            "بعد اختيار الدومين سيتم إنشاء إيميل جديد\n"
+            "تلقائياً عليه.",
+            reply_markup=get_free_domains_keyboard(domains),
+        )
+        return
+
+    if re.fullmatch(r"free_domain_\d+", data):
+        domain_index = int(data.rsplit("_", 1)[1])
+        domains = list(context.user_data.get("free_domains") or [])
+        if domain_index >= len(domains):
+            domains = await asyncio.to_thread(get_available_domains)
+            context.user_data["free_domains"] = list(domains)
+            await query.edit_message_text(
+                "🌐 اختيار الدومين\n\n"
+                "تم تحديث قائمة الدومينات. اختر الدومين من جديد.",
+                reply_markup=(
+                    get_free_domains_keyboard(domains)
+                    if domains
+                    else InlineKeyboardMarkup([[
+                        InlineKeyboardButton(
+                            "🔄 تحديث الدومينات",
+                            callback_data="refresh_free_domains",
+                            style="success",
+                        )
+                    ], [
+                        InlineKeyboardButton(
+                            get_text(lang, "btn_back"),
+                            callback_data="create_email",
+                            style="primary",
+                        )
+                    ]])
+                ),
+            )
+            return
+
+        current_count = len(get_user_emails(user_id))
+        email_limit = get_effective_email_limit(user_id)
+        if (not is_admin(user_id)) and email_limit > 0 and current_count >= email_limit:
+            await query.edit_message_text(
+                "⚠️ لقد وصلت إلى الحد المسموح لإنشاء الإيميلات.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        get_text(lang, "btn_back"),
+                        callback_data="back_to_menu",
+                        style="primary",
+                    )
+                ]]),
+            )
+            return
+
+        domain = domains[domain_index]
+        await query.edit_message_text(
+            "🌐 إنشاء الإيميل\n\n"
+            f"جاري إنشاء إيميل جديد على الدومين:\n@{domain}"
+        )
+        email, token, password = await asyncio.to_thread(create_email_with_domain, domain)
+        if email and token:
+            add_user_email(user_id, email, token, password)
+            await asyncio.to_thread(increment_daily_stat, "emails_created")
+            await query.edit_message_text(
+                get_text(lang, "email_created", email=telegram_html(email)),
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        get_text(lang, "btn_back"),
+                        callback_data="back_to_menu",
+                        style="primary",
+                    )
+                ]]),
+                parse_mode="HTML",
+            )
+        else:
+            await query.edit_message_text(
+                "❌ فشل إنشاء الإيميل على الدومين المحدد.\n\n"
+                "قد يكون الدومين لم يعد متاحاً، حدّث القائمة وحاول مرة أخرى.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        "🔄 تحديث الدومينات",
+                        callback_data="refresh_free_domains",
+                        style="success",
+                    )],
+                    [InlineKeyboardButton(
+                        get_text(lang, "btn_back"),
+                        callback_data="create_email",
+                        style="primary",
+                    )],
                 ]),
             )
         return
