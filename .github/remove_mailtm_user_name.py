@@ -19,15 +19,16 @@ for filename in ('telegram_bot.py', 'bot_code_export.txt'):
 source = Path('telegram_bot.py').read_text(encoding='utf-8')
 compile(source, 'telegram_bot.py', 'exec')
 
-# نتأكد أن النسخة الخاصة بالمستخدم لم تعد تعرض اسم الخدمة، مع إبقاء النسخة الخاصة بالأدمن دون تغيير.
+# نتأكد أن رسالة الخطأ الخاصة بالمستخدم فقط لم تعد تعرض اسم الخدمة.
 user_marker = 'def build_inbox_error_view('
-admin_marker = 'def build_admin_member_inbox_error_view('
 user_pos = source.find(user_marker)
-admin_pos = source.find(admin_marker)
-if user_pos < 0 or admin_pos < 0:
-    raise SystemExit('required inbox error functions were not found')
-user_block = source[user_pos:admin_pos]
+if user_pos < 0:
+    raise SystemExit('normal-user inbox error function was not found')
+next_def = source.find('\ndef ', user_pos + len(user_marker))
+if next_def < 0:
+    next_def = len(source)
+user_block = source[user_pos:next_def]
 if 'Mail.tm' in user_block or 'mail.tm' in user_block:
-    raise SystemExit('service name still appears in the normal-user inbox error block')
-if OLD not in source[admin_pos:]:
+    raise SystemExit('service name still appears in the normal-user inbox error function')
+if OLD not in source:
     raise SystemExit('admin-only error wording was unexpectedly changed')
