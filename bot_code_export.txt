@@ -1662,7 +1662,7 @@ def build_inbox_error_view(error_code, email_index: int, status=None):
     if error_code == "token_invalid":
         text = (
             "⚠️ تعذر تجديد جلسة هذا البريد تلقائياً.\n\n"
-            "قد تكون بيانات البريد قديمة أو لم يعد الحساب متاحاً على Mail.tm."
+            "قد تكون بيانات البريد قديمة أو لم يعد البريد متاحاً حالياً."
         )
         rows = [
             [InlineKeyboardButton(
