@@ -16,7 +16,7 @@ CONSTANTS_NEW = (
 )
 
 FUNCTION_MARKER = ")\n\n\ndef consume_action_cooldown(user_id: int, action: str, cooldown_seconds: int) -> int:\n"
-RATE_LIMIT_FUNCTION = ''' )
+RATE_LIMIT_FUNCTION = ''')
 
 
 def wait_for_mail_request_slot():
@@ -42,7 +42,7 @@ def wait_for_mail_request_slot():
 
 
 def consume_action_cooldown(user_id: int, action: str, cooldown_seconds: int) -> int:
-'''.replace("''' )", ")")
+'''
 
 MAIL_REQUEST_OLD = '''    for attempt in range(3):
         try:
@@ -216,12 +216,12 @@ for item in required:
         raise SystemExit(f"missing expected fix marker: {item}")
 
 user_start = source.find("def build_inbox_error_view(")
-admin_start = source.find("def build_admin_member_inbox_error_view(")
-if user_start < 0 or admin_start < 0 or admin_start <= user_start:
-    raise SystemExit("inbox error view markers were not found")
-user_error_block = source[user_start:admin_start]
-if "Mail.tm" in user_error_block or "mail.tm" in user_error_block:
-    raise SystemExit("service name leaked into the normal-user inbox error view")
+user_token_end = source.find("        return text, InlineKeyboardMarkup(rows)", user_start)
+if user_start < 0 or user_token_end < 0:
+    raise SystemExit("normal-user inbox error view markers were not found")
+user_token_block = source[user_start:user_token_end]
+if "Mail.tm" in user_token_block or "mail.tm" in user_token_block:
+    raise SystemExit("service name leaked into the normal-user token error message")
 
 # لا نغيّر التدفق اليدوي للبريد ولا طريقة إنشاء الإيميلات أو كلمة السر أو القوائم.
 for untouched_marker in (
