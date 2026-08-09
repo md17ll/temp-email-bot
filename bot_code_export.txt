@@ -55,8 +55,10 @@ import os
 import re
 import secrets
 import string
+import threading
 import time
 import traceback
+from collections import deque
 from datetime import timedelta
 from html import escape, unescape
 
@@ -95,10 +97,36 @@ INBOX_COOLDOWN_SECONDS = 3
 LEGACY_MAIL_PASSWORD = os.getenv("MAIL_TM_LEGACY_PASSWORD", "TempMail123")
 FIXED_MAIL_PASSWORD = "TempMail123"
 USER_ACTION_TIMESTAMPS = {}
+MAIL_REQUEST_MAX_PER_SECOND = 6
+MAIL_REQUEST_WINDOW_SECONDS = 1.0
+MAIL_REQUEST_TIMESTAMPS = deque()
+MAIL_REQUEST_LOCK = threading.Lock()
 DEFAULT_SUBSCRIPTION_MESSAGE = (
     "⚠️ يجب عليك الاشتراك في القنوات التالية لاستخدام البوت:\n\n"
     "بعد الاشتراك في جميع القنوات اضغط: ✅ التحقق من الاشتراك"
 )
+
+
+def wait_for_mail_request_slot():
+    """تنظيم طلبات خدمة البريد حتى لا تخرج دفعات كبيرة متزامنة من نفس السيرفر."""
+    while True:
+        with MAIL_REQUEST_LOCK:
+            now = time.monotonic()
+            while (
+                MAIL_REQUEST_TIMESTAMPS
+                and now - MAIL_REQUEST_TIMESTAMPS[0] >= MAIL_REQUEST_WINDOW_SECONDS
+            ):
+                MAIL_REQUEST_TIMESTAMPS.popleft()
+
+            if len(MAIL_REQUEST_TIMESTAMPS) < MAIL_REQUEST_MAX_PER_SECOND:
+                MAIL_REQUEST_TIMESTAMPS.append(now)
+                return
+
+            wait_seconds = MAIL_REQUEST_WINDOW_SECONDS - (
+                now - MAIL_REQUEST_TIMESTAMPS[0]
+            )
+
+        time.sleep(max(0.01, wait_seconds + 0.01))
 
 
 def consume_action_cooldown(user_id: int, action: str, cooldown_seconds: int) -> int:
@@ -1346,6 +1374,7 @@ def mail_request(method: str, path: str, return_error=False, **kwargs):
 
     for attempt in range(3):
         try:
+            wait_for_mail_request_slot()
             response = requests.request(
                 method,
                 f"{API}{path}",
@@ -1516,57 +1545,86 @@ def create_email_with_domain(domain):
         return None, None, None
 
 
-def refresh_email_token_data(email_data):
-    """تجديد توكن بريد واحد من العنوان وكلمة المرور المحفوظة."""
+def refresh_email_token_data_detailed(email_data):
+    """تجديد جلسة بريد واحد مع إرجاع سبب الفشل بدقة."""
     if not isinstance(email_data, dict):
-        return None
+        return {"token": None, "error": "token_invalid", "status": None}
 
     address = str(email_data.get("address") or "").strip()
     password = str(email_data.get("password") or LEGACY_MAIL_PASSWORD)
     if not address or not password:
-        return None
+        return {"token": None, "error": "token_invalid", "status": None}
 
-    response = mail_request(
+    response, request_error = mail_request(
         "POST",
         "/token",
         json={"address": address, "password": password},
+        return_error=True,
     )
-    if response is None or response.status_code != 200:
-        status = response.status_code if response is not None else "network"
-        print(f"⚠️ تعذر تجديد توكن {address}: {status}")
-        return None
 
-    try:
-        token = response.json().get("token")
-    except (ValueError, AttributeError):
-        token = None
-    if not token:
-        return None
+    if response is None:
+        error_code = request_error or "network"
+        print(f"⚠️ تعذر تجديد جلسة {address}: {error_code}")
+        return {"token": None, "error": error_code, "status": None}
 
-    email_data["token"] = token
-    email_data["password"] = password
-    return token
+    status = response.status_code
+    if status == 200:
+        try:
+            token = response.json().get("token")
+        except (ValueError, AttributeError):
+            token = None
+
+        if not token:
+            print(f"⚠️ رد تجديد الجلسة غير صالح للبريد {address}")
+            return {"token": None, "error": "invalid_response", "status": status}
+
+        email_data["token"] = token
+        email_data["password"] = password
+        return {"token": token, "error": None, "status": status}
+
+    if status == 429:
+        error_code = "rate_limited"
+    elif status in (500, 502, 503, 504):
+        error_code = "service_unavailable"
+    elif status in (400, 401, 403, 404, 422):
+        error_code = "token_invalid"
+    else:
+        error_code = "http_error"
+
+    print(f"⚠️ فشل تجديد جلسة {address}: HTTP {status} ({error_code})")
+    return {"token": None, "error": error_code, "status": status}
 
 
-def refresh_user_email_token(user_id: int, email_index: int):
-    """تجديد توكن بريد المستخدم وحفظه في PostgreSQL."""
+def refresh_email_token_data(email_data):
+    """واجهة متوافقة ترجع التوكن فقط للأجزاء القديمة."""
+    return refresh_email_token_data_detailed(email_data).get("token")
+
+
+def refresh_user_email_token_detailed(user_id: int, email_index: int):
+    """تجديد جلسة بريد المستخدم وحفظها مع إرجاع سبب الفشل."""
     emails = get_user_emails(user_id)
     if email_index < 0 or email_index >= len(emails):
-        return None
+        return {"token": None, "error": "email_missing", "status": None}
 
-    token = refresh_email_token_data(emails[email_index])
+    result = refresh_email_token_data_detailed(emails[email_index])
+    token = result.get("token")
     if not token:
-        return None
+        return result
 
     data = get_user_data(user_id)
     user_database[str(user_id)] = data
     if not save_single_user(str(user_id), data):
         print(f"⚠️ تم تجديد التوكن لكن تعذر حفظه للمستخدم {user_id}")
-    return token
+    return result
+
+
+def refresh_user_email_token(user_id: int, email_index: int):
+    """واجهة متوافقة ترجع التوكن فقط للأجزاء القديمة."""
+    return refresh_user_email_token_detailed(user_id, email_index).get("token")
 
 
 def check_user_inbox_detailed(user_id: int, email_index: int):
-    """فحص الصندوق وتجديد التوكن تلقائياً مرة واحدة عند HTTP 401."""
+    """فحص الصندوق وتجديد الجلسة مرة واحدة مع الحفاظ على سبب الفشل الحقيقي."""
     emails = get_user_emails(user_id)
     if email_index < 0 or email_index >= len(emails):
         return {"messages": None, "error": "email_missing", "status": None}
@@ -1576,14 +1634,29 @@ def check_user_inbox_detailed(user_id: int, email_index: int):
     if result.get("error") != "token_invalid":
         return result
 
-    new_token = refresh_user_email_token(user_id, email_index)
+    refresh_result = refresh_user_email_token_detailed(user_id, email_index)
+    new_token = refresh_result.get("token")
     if not new_token:
+        refresh_error = refresh_result.get("error")
+        if refresh_error in (
+            "rate_limited",
+            "service_unavailable",
+            "timeout",
+            "connection",
+            "network",
+            "invalid_response",
+            "http_error",
+        ):
+            return {
+                "messages": None,
+                "error": refresh_error,
+                "status": refresh_result.get("status"),
+            }
         return result
 
     retry_result = check_inbox_detailed(new_token)
     retry_result["token_refreshed"] = retry_result.get("error") is None
     return retry_result
-
 
 def get_user_message_content(user_id: int, email_index: int, message_id: str):
     """تحميل رسالة كاملة، مع تجديد التوكن تلقائياً إذا انتهى أثناء الفتح."""
