@@ -1995,7 +1995,7 @@ async def show_mail_analytics(query, data: str):
             member = user_database.get(str(entry["owner_id"]), {})
             member_name = member.get("first_name") or str(entry["owner_id"])
             address = str(entry["email_address"])
-            label = f"📧 {address[:25]} | {entry['quantity']}"
+            label = f"📧 {address[:23]} | 👤 {member_name[:12]} | {entry['quantity']}"
             rows.append([InlineKeyboardButton(
                 label,
                 callback_data=f"ma_box_{code}_{entry['email_code'].strip()}_0",
