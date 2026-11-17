@@ -159,7 +159,7 @@ def save_mailbox_snapshot(connect, owner_id, address, messages):
         unique_messages = set()
         with conn.cursor() as cur:
             for item in messages:
-                if not isinstance(item, dict):
+                if not isinstance(item, dict) or item.get("isDeleted") is True:
                     continue
                 message_id = str(item.get("id") or "").strip()
                 if not message_id or message_id in unique_messages:
