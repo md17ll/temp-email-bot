@@ -1,0 +1,42 @@
+name: Check mail analytics
+
+on:
+  push:
+    branches: [feature/mail-message-analytics]
+  pull_request:
+    paths:
+      - telegram_bot.py
+      - mail_analytics.py
+      - tests/test_mail_analytics.py
+      - .github/workflows/mail-analytics-check.yml
+
+jobs:
+  python-and-database-tests:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: analytics
+          POSTGRES_PASSWORD: analytics_test_only
+          POSTGRES_DB: analytics
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U analytics -d analytics"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://analytics:analytics_test_only@localhost:5432/analytics
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Check syntax
+        run: python -m py_compile telegram_bot.py mail_analytics.py
+      - name: Test mail analytics in isolated database
+        run: python -m unittest discover -s tests -v
