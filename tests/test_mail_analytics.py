@@ -94,7 +94,11 @@ class DatabaseTests(unittest.TestCase):
     def test_deleting_email_removes_only_live_records(self):
         self.assertTrue(analytics.save_mailbox_snapshot(connect, 432,
                          "test2@mail.tm", [{"id": "x", "from": {"address": "hi@discord.com"}}]))
-        self.assertTrue(analytics.purge_removed_emails(connect, []))
+        # Empty member load is ambiguous and must never wipe live data.
+        self.assertFalse(analytics.purge_removed_emails(connect, []))
+        self.assertEqual(analytics.read_overview(connect)["available"], 1)
+        # Deleting this email while another mailbox remains is a valid cleanup.
+        self.assertTrue(analytics.purge_removed_emails(connect, ["kept@mail.tm"]))
         overview = analytics.read_overview(connect)
         self.assertEqual(overview["lifetime"], 1)
         self.assertEqual(overview["available"], 0)
