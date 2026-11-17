@@ -83,6 +83,12 @@ class DatabaseTests(unittest.TestCase):
         # A duplicate from a subsequent successful scan must not be counted again.
         self.assertTrue(analytics.save_mailbox_snapshot(connect, 123, address, initial))
         self.assertEqual(analytics.read_overview(connect)["lifetime"], 2)
+        # A soft-deleted message returned by the API must not stay visible.
+        flagged = [dict(initial[0], isDeleted=True), initial[1]]
+        self.assertTrue(analytics.save_mailbox_snapshot(connect, 123, address, flagged))
+        overview = analytics.read_overview(connect)
+        self.assertEqual(overview["lifetime"], 2)
+        self.assertEqual(overview["available"], 1)
 
     def test_deleting_email_removes_only_live_records(self):
         self.assertTrue(analytics.save_mailbox_snapshot(connect, 432,
