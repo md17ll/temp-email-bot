@@ -158,6 +158,12 @@ def save_mailbox_snapshot(connect, owner_id, address, messages):
         visible_ids = []
         unique_messages = set()
         with conn.cursor() as cur:
+            cur.execute(
+                "SELECT message_id FROM mail_analytics_live "
+                "WHERE email_address=%s AND owner_id=%s",
+                (address, int(owner_id)),
+            )
+            already_live = {row[0] for row in cur.fetchall()}
             for item in messages:
                 if not isinstance(item, dict) or item.get("isDeleted") is True:
                     continue
@@ -166,6 +172,9 @@ def save_mailbox_snapshot(connect, owner_id, address, messages):
                     continue
                 unique_messages.add(message_id)
                 visible_ids.append(message_id)
+                # Unchanged messages need no writes and no further mail.tm requests.
+                if message_id in already_live:
+                    continue
                 sender_data = item.get("from") or {}
                 sender = str(sender_data.get("address") or "") if isinstance(sender_data, dict) else ""
                 sender = sender[:320]
