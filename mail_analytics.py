@@ -362,10 +362,16 @@ def get_live_message(connect, row_id):
         conn.close()
 
 
-async def monitor_mailboxes(connect, user_database, fetch_all):
-    """Visit saved mailboxes gradually; never turn mailbox errors into deletions."""
+async def monitor_mailboxes(connect, user_database, fetch_all, status=None):
+    """Inspect saved mailboxes gradually; failed requests never erase messages.
+
+    This is a background scanner. Status is process-local and only reports
+    diagnostics to authenticated bot admins; no passwords or message text.
+    """
+    status = status if status is not None else {}
     await asyncio.sleep(10)
     while True:
+        previous_cycle = int(status.get("cycle", 0))
         try:
             mailboxes = []
             for uid, member in list(user_database.items()):
@@ -373,27 +379,76 @@ async def monitor_mailboxes(connect, user_database, fetch_all):
                     address = str(record.get("address") or "").strip().lower()
                     if address:
                         mailboxes.append((int(uid), index, address))
+
+            status.update({
+                "state": "جاري الفحص",
+                "cycle": previous_cycle + 1,
+                "total": len(mailboxes),
+                "processed": 0,
+                "ok": 0,
+                "failed": 0,
+                "empty": 0,
+                "with_messages": 0,
+                "messages_found": 0,
+                "errors": {},
+                "examples": [],
+            })
             await asyncio.to_thread(
                 purge_removed_emails, connect, [box[2] for box in mailboxes]
             )
+
             for uid, index, address in mailboxes:
-                # The owner may have deleted/reordered this email since the snapshot.
                 latest = user_database.get(str(uid), {}).get("emails") or []
-                if index >= len(latest) or str(latest[index].get("address", "")).lower() != address:
-                    continue
-                try:
-                    messages = await asyncio.to_thread(fetch_all, uid, index)
-                    if messages is not None:
-                        await asyncio.to_thread(
-                            save_mailbox_snapshot, connect, uid, address, messages
-                        )
-                except asyncio.CancelledError:
-                    raise
-                except Exception as error:
-                    print(f"⚠️ خطأ عند فحص البريد {address}: {error}")
+                if index >= len(latest) or str(latest[index].get("address") or "").lower() != address:
+                    result = {"messages": None, "error": "email_changed"}
+                else:
+                    try:
+                        result = await asyncio.to_thread(fetch_all, uid, index)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as error:
+                        print(f"⚠️ فشل فحص صندوق عضو {uid}: {type(error).__name__}")
+                        result = {"messages": None, "error": "unexpected_error"}
+
+                if isinstance(result, dict):
+                    messages = result.get("messages")
+                    error_code = str(result.get("error") or "mailbox_error")
+                else:
+                    # Accept the legacy scanner return type for compatibility.
+                    messages = result
+                    error_code = "mailbox_error"
+
+                if isinstance(messages, list):
+                    saved = await asyncio.to_thread(
+                        save_mailbox_snapshot, connect, uid, address, messages
+                    )
+                    if saved:
+                        status["ok"] += 1
+                        status["messages_found"] += len(messages)
+                        if messages:
+                            status["with_messages"] += 1
+                        else:
+                            status["empty"] += 1
+                    else:
+                        error_code = "database_error"
+                        messages = None
+
+                if not isinstance(messages, list):
+                    status["failed"] += 1
+                    error_counts = status["errors"]
+                    error_counts[error_code] = int(error_counts.get(error_code, 0)) + 1
+                    if len(status["examples"]) < 8:
+                        status["examples"].append({
+                            "owner_id": uid, "email": address, "error": error_code
+                        })
+                status["processed"] += 1
                 await asyncio.sleep(POLL_PAUSE_SECONDS)
+
+            status["state"] = "اكتملت الدورة"
+            status["last_completed"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            print(f"⚠️ دورة فحص البريد لم تكتمل: {error}")
+            status["state"] = "تعثر الفحص"
+            print(f"⚠️ دورة فحص البريد لم تكتمل: {type(error).__name__}: {error}")
         await asyncio.sleep(CYCLE_PAUSE_SECONDS)

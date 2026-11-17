@@ -99,5 +99,87 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(overview["available"], 0)
 
 
+
+class DashboardScannerTests(unittest.TestCase):
+    """Run the small scanner function with mocked mail.tm responses only."""
+
+    @staticmethod
+    def build_scanner(pages):
+        import ast
+        from pathlib import Path
+        from types import SimpleNamespace
+
+        tree = ast.parse(Path("telegram_bot.py").read_text(encoding="utf-8"))
+        definition = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "fetch_complete_mailbox_for_analytics"
+        )
+        namespace = {
+            "get_user_emails": lambda user_id: [{"token": "testing-token"}],
+            "refresh_user_email_token_detailed": lambda uid, idx: {
+                "token": None, "error": "token_invalid"
+            },
+        }
+
+        def mail_request(method, endpoint, **kwargs):
+            page = int(endpoint.split("page=")[-1])
+            response = pages.get(page)
+            if response is None:
+                return None, "network"
+            code, payload = response
+            return SimpleNamespace(status_code=code, json=lambda: payload), None
+
+        namespace["mail_request"] = mail_request
+        code = compile(
+            ast.Module(body=[definition], type_ignores=[]),
+            "telegram_bot.py",
+            "exec",
+        )
+        exec(code, namespace)
+        return namespace["fetch_complete_mailbox_for_analytics"]
+
+    def test_analytics_scan_empty_mailbox_is_success(self):
+        scanner = self.build_scanner({
+            1: (200, {"hydra:member": [], "hydra:totalItems": 0})
+        })
+        self.assertEqual(scanner(1, 0), {"messages": [], "error": None})
+
+    def test_analytics_scan_http_429_is_not_empty_mailbox(self):
+        scanner = self.build_scanner({1: (429, {})})
+        self.assertEqual(scanner(1, 0)["error"], "http_429")
+        self.assertIsNone(scanner(1, 0)["messages"])
+
+    def test_analytics_scan_fetches_all_pages(self):
+        first_page = [{"id": str(i)} for i in range(30)]
+        scanner = self.build_scanner({
+            1: (200, {"hydra:member": first_page, "hydra:totalItems": 31}),
+            2: (200, {"hydra:member": [{"id": "30"}], "hydra:totalItems": 31}),
+        })
+        result = scanner(1, 0)
+        self.assertIsNone(result["error"])
+        self.assertEqual(len(result["messages"]), 31)
+
+    def test_analytics_scan_refuses_incomplete_mailbox(self):
+        scanner = self.build_scanner({
+            1: (200, {"hydra:member": [{"id": "1"}], "hydra:totalItems": 10})
+        })
+        result = scanner(1, 0)
+        self.assertEqual(result["error"], "incomplete_mailbox")
+        self.assertIsNone(result["messages"])
+
+    def test_old_admin_message_view_stays_and_new_dashboard_does_not_read_bodies(self):
+        from pathlib import Path
+        source = Path("telegram_bot.py").read_text(encoding="utf-8")
+        dashboard = source.split("async def show_mail_analytics(", 1)[1].split(
+            "# ================== بيانات المستخدمين ==================", 1
+        )[0]
+        self.assertNotIn("get_user_message_content", dashboard)
+        self.assertNotIn("get_message_text", dashboard)
+        self.assertIn("ma_diagnostics", dashboard)
+        self.assertIn("🆔 ID:", dashboard)
+        self.assertIn('callback_data=f"member_msg_', source)
+        self.assertIn("get_user_message_content, target_id", source)
+
 if __name__ == "__main__":
     unittest.main()

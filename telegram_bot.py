@@ -1835,64 +1835,96 @@ def get_message_text(full: dict) -> str:
 
 # ================== فهرس إحصائيات البريد (مستقل عن عرض البريد المعتاد) ==================
 def fetch_complete_mailbox_for_analytics(user_id: int, email_index: int):
-    """Return a complete inbox snapshot, or None on any failure/truncation.
+    """Retrieve an entire mail.tm inbox, with diagnostic errors.
 
-    Never interpret a failed mail.tm request as an empty mailbox.
+    A partial or failed fetch is NEVER an empty inbox and can NEVER erase
+    previously indexed live messages.
     """
+    def result(messages=None, error=None):
+        return {"messages": messages, "error": error}
+
     emails = get_user_emails(user_id)
     if email_index < 0 or email_index >= len(emails):
-        return None
+        return result(error="email_missing")
     token = emails[email_index].get("token")
     if not token:
-        token = refresh_user_email_token(user_id, email_index)
-    if not token:
-        return None
+        refresh = refresh_user_email_token_detailed(user_id, email_index)
+        token = refresh.get("token")
+        if not token:
+            return result(error=refresh.get("error") or "token_invalid")
 
     collected = []
     for page in range(1, 21):
-        response = None
         for attempt in range(2):
-            response = mail_request(
+            response, request_error = mail_request(
                 "GET", f"/messages?page={page}",
                 headers={"Authorization": f"Bearer {token}"},
+                return_error=True,
             )
             if response is not None and response.status_code == 401 and attempt == 0:
-                token = refresh_user_email_token(user_id, email_index)
+                refresh = refresh_user_email_token_detailed(user_id, email_index)
+                token = refresh.get("token")
                 if token:
                     continue
+                return result(error=refresh.get("error") or "token_invalid")
             break
 
-        if response is None or response.status_code != 200:
-            return None
+        if response is None:
+            return result(error=request_error or "network")
+        if response.status_code != 200:
+            return result(error=f"http_{response.status_code}")
         try:
             payload = response.json()
             page_items = payload.get("hydra:member")
-            total_items = payload.get("hydra:totalItems")
+            total_raw = payload.get("hydra:totalItems")
             if not isinstance(page_items, list):
-                return None
-            total_items = int(total_items) if total_items is not None else None
+                return result(error="invalid_response")
+            total_items = int(total_raw) if total_raw is not None else None
+            if total_items is not None and total_items < 0:
+                return result(error="invalid_response")
         except (ValueError, TypeError, AttributeError):
-            return None
+            return result(error="invalid_response")
 
         collected.extend(page_items)
         if total_items is not None and len(collected) >= total_items:
-            return collected
+            return result(messages=collected[:total_items])
         if not page_items:
-            return collected if total_items is None or total_items == len(collected) else None
+            if total_items is None or total_items == len(collected):
+                return result(messages=collected)
+            return result(error="incomplete_mailbox")
         if len(page_items) < 30:
-            return collected if total_items is None or total_items == len(collected) else None
-    # More than 600 messages: postpone instead of erasing an incomplete index.
-    return None
+            if total_items is None or total_items == len(collected):
+                return result(messages=collected)
+            return result(error="incomplete_mailbox")
+
+    # Hard cap avoids runaway scans. Do not replace old snapshot with partial data.
+    return result(error="page_limit")
 
 
 async def start_mail_analytics(application):
+    scan_status = {
+        "state": "تهيئة الفحص",
+        "total": 0,
+        "processed": 0,
+        "ok": 0,
+        "failed": 0,
+        "empty": 0,
+        "with_messages": 0,
+        "messages_found": 0,
+        "errors": {},
+        "examples": [],
+    }
+    application.bot_data["mail_analytics_status"] = scan_status
     ok = await asyncio.to_thread(mail_analytics.initialize, get_db_connection)
     if not ok:
+        scan_status["state"] = "تعذر الاتصال بقاعدة البيانات"
         print("⚠️ إحصائيات الرسائل غير مفعلة مؤقتاً؛ البوت الأساسي سيعمل كالمعتاد")
         return
+    scan_status["state"] = "بانتظار بدء الفحص"
     application.bot_data["mail_analytics_task"] = asyncio.create_task(
         mail_analytics.monitor_mailboxes(
-            get_db_connection, user_database, fetch_complete_mailbox_for_analytics
+            get_db_connection, user_database, fetch_complete_mailbox_for_analytics,
+            scan_status,
         )
     )
     print("✅ بدأت متابعة إحصائيات البريد تدريجياً")
@@ -1905,8 +1937,13 @@ async def stop_mail_analytics(application):
         await asyncio.gather(task, return_exceptions=True)
 
 
-async def show_mail_analytics(query, data: str):
-    """Admin-only Telegram inline views. All message bodies fetched live on demand."""
+async def show_mail_analytics(query, data: str, scan_status=None):
+    """Telegram admin dashboard: service + member + ID + mailbox only.
+
+    This dashboard must NEVER render message contents, subjects, senders, or OTPs.
+    The pre-existing 'عرض إيميلات عضو' controls are intentionally untouched.
+    """
+    scan_status = scan_status or {}
     def back(callback, label="🔙 رجوع"):
         return InlineKeyboardButton(label, callback_data=callback, style="primary")
 
@@ -1927,33 +1964,98 @@ async def show_mail_analytics(query, data: str):
             text, reply_markup=InlineKeyboardMarkup(rows), parse_mode="HTML"
         )
 
+    saved_email_count = sum(
+        len(member.get("emails") or []) for member in user_database.values()
+    )
     overview = await asyncio.to_thread(mail_analytics.read_overview, get_db_connection)
     if overview is None:
-        await display("⚠️ إحصائيات الرسائل غير متاحة حالياً؛ تأكد من قاعدة البيانات.",
-                      [[back("section_stats")]])
+        await display(
+            "⚠️ إحصائيات الرسائل غير متاحة حالياً؛ تأكد من قاعدة البيانات.\n"
+            f"🔍 حالة الفحص: {telegram_html(scan_status.get('state', 'غير معروف'))}",
+            [[back("section_stats")]]
+        )
         return
 
     services = overview["services"]
     if data == "ma_home":
         last = overview.get("last_scan")
-        last_text = last.strftime("%Y-%m-%d %H:%M") if last else "لم يكتمل أي فحص بعد"
+        last_text = last.strftime("%Y-%m-%d %H:%M UTC") if last else "لم يكتمل أي فحص بعد"
+        scanned = int(scan_status.get("processed") or 0)
+        total = int(scan_status.get("total") or 0)
+        passed = int(scan_status.get("ok") or 0)
+        failed = int(scan_status.get("failed") or 0)
         text = (
             "📬 <b>إحصائيات الرسائل</b>\n\n"
             f"📨 وصل إجمالاً منذ بدء التسجيل: <b>{int(overview['lifetime'])}</b>\n"
             f"📥 الرسائل الموجودة الآن: <b>{int(overview['available'])}</b>\n"
             f"📧 إيميلات لديها رسائل: {int(overview['inboxes'])}\n"
             f"👥 أعضاء لديهم رسائل: {int(overview['members'])}\n"
-            f"📅 رسائل اليوم (UTC): {int(overview['today'])}\n"
-            f"🔄 آخر فحص ناجح: {telegram_html(last_text)}\n\n"
-            "ℹ️ الفحص تدريجي. لا نحفظ نصوص الرسائل أو رموز التحقق. "
-            "الرسائل المحذوفة تختفي بعد فحص ناجح للصندوق، "
-            "والعداد التراكمي لا ينقص."
+            f"📅 رسائل اليوم (UTC): {int(overview['today'])}\n\n"
+            "🔍 <b>حالة فحص الإيميلات</b>\n"
+            f"📧 إيميلات الأعضاء المحفوظة: {saved_email_count}\n"
+            f"⚙️ الحالة: {telegram_html(scan_status.get('state', 'غير معروف'))}\n"
+            f"📊 فُحص {scanned} من {total} | ✅ {passed} | ❌ {failed}\n"
+            f"⏳ المتبقية: {max(0, total - scanned)}\n"
+            f"🕓 آخر فحص ناجح: {telegram_html(last_text)}\n\n"
+            "ℹ️ العدد التاريخي يشمل فقط الرسائل التي رصدها النظام، "
+            "وليس الرسائل المحذوفة قبل تفعيله. "
+            "تفاصيل الرسائل لا تظهر بهذا القسم."
         )
         await display(text, [
             [InlineKeyboardButton(
                 f"🗂️ الخدمات ({len(services)})", callback_data="ma_services_0", transparent=True
             )],
+            [InlineKeyboardButton(
+                "🩺 تفاصيل الفحص", callback_data="ma_diagnostics", transparent=True
+            )],
+            [InlineKeyboardButton(
+                "🔄 تحديث الإحصائيات", callback_data="ma_home", transparent=True
+            )],
             [back("section_stats")],
+        ])
+        return
+
+    if data == "ma_diagnostics":
+        status_name = telegram_html(scan_status.get("state", "غير معروف"))
+        total = int(scan_status.get("total") or 0)
+        processed = int(scan_status.get("processed") or 0)
+        success = int(scan_status.get("ok") or 0)
+        failures = int(scan_status.get("failed") or 0)
+        issues = scan_status.get("errors") or {}
+        issue_lines = [
+            f"• {telegram_html(k)}: {int(v)}"
+            for k, v in sorted(issues.items(), key=lambda entry: (-entry[1], entry[0]))
+        ]
+        examples = (scan_status.get("examples") or [])[:8]
+        detail_lines = [
+            f"• ID: <code>{int(item['owner_id'])}</code> | "
+            f"<code>{telegram_html(item['email'])}</code> | "
+            f"{telegram_html(item['error'])}"
+            for item in examples
+        ]
+        text = (
+            "🩺 <b>تشخيص فحص mail.tm</b>\n\n"
+            f"⚙️ الحالة: {status_name}\n"
+            f"🔁 دورة الفحص: {int(scan_status.get('cycle') or 0)}\n"
+            f"📧 إجمالي إيميلات الأعضاء: {saved_email_count}\n"
+            f"📊 المفحوصة بالدورة: {processed}/{total}\n"
+            f"✅ نجح فحصها: {success}\n"
+            f"📭 صناديق فارغة: {int(scan_status.get('empty') or 0)}\n"
+            f"📬 صناديق فيها رسائل: {int(scan_status.get('with_messages') or 0)}\n"
+            f"📨 رسائل ظهرت بالدورة: {int(scan_status.get('messages_found') or 0)}\n"
+            f"❌ فشل فحصها: {failures}\n"
+            f"⏳ المتبقية: {max(0, total - processed)}\n"
+            f"🕓 آخر دورة مكتملة: {telegram_html(scan_status.get('last_completed') or 'لم تكتمل بعد')}\n\n"
+            "<b>أسباب الأخطاء</b>\n"
+            + ("\n".join(issue_lines) if issue_lines else "لا توجد أخطاء مسجلة بالدورة.")
+            + "\n\n<b>أمثلة على الإيميلات التي تعذّر فحصها</b>\n"
+            + ("\n".join(detail_lines) if detail_lines else "لا يوجد.")
+        )
+        await display(text, [
+            [InlineKeyboardButton(
+                "🔄 تحديث تفاصيل الفحص", callback_data="ma_diagnostics", transparent=True
+            )],
+            [back("ma_home")],
         ])
         return
 
@@ -1990,112 +2092,45 @@ async def show_mail_analytics(query, data: str):
             mail_analytics.read_service_email_groups,
             get_db_connection, service["service"], page
         )
-        rows = []
-        for entry in entries:
-            member = user_database.get(str(entry["owner_id"]), {})
-            member_name = member.get("first_name") or str(entry["owner_id"])
-            address = str(entry["email_address"])
-            label = f"📧 {address[:23]} | 👤 {member_name[:12]} | {entry['quantity']}"
+        lines = []
+        for i, entry in enumerate(entries, start=page * mail_analytics.PAGE_SIZE + 1):
+            owner_id = int(entry["owner_id"])
+            member = user_database.get(str(owner_id), {})
+            full_name = " ".join(
+                part for part in (member.get("first_name"), member.get("last_name"))
+                if part
+            ).strip() or "اسم غير متوفر"
+            username = "@" + member["username"] if member.get("username") else "—"
+            lines.append(
+                f"<b>{i}. 👤 {telegram_html(full_name)}</b>\n"
+                f"🆔 ID: <code>{owner_id}</code> | {telegram_html(username)}\n"
+                f"📧 <code>{telegram_html(entry['email_address'])}</code>\n"
+                f"📨 عدد الرسائل الحالية: {int(entry['quantity'])}"
+            )
+        rows = navigation(f"ma_service_{code}_", page, count)
+        if count:
             rows.append([InlineKeyboardButton(
-                label,
-                callback_data=f"ma_box_{code}_{entry['email_code'].strip()}_0",
-                transparent=True,
+                "🛑 حظر عضو عبر ID", callback_data="ban_user", transparent=True
             )])
-        rows.extend(navigation(f"ma_service_{code}_", page, count))
         rows.append([back("ma_services_0")])
         await display(
-            f"{telegram_html(service['label'])}\n\n"
-            f"📨 الرسائل الموجودة: {service['available']}\n"
-            f"📊 وصل إجمالاً: {service['total']}\n\n"
-            + ("اختر الإيميل لعرض رسائله وصاحبه:" if count else
-               "ما في رسائل موجودة الآن لهذه الخدمة."),
+            f"<b>{telegram_html(service['label'])}</b>\n\n"
+            f"📥 الرسائل الموجودة: {int(service['available'])}\n"
+            f"📊 وصل إجمالاً: {int(service['total'])}\n"
+            f"📧 الإيميلات الحالية: {count}\n\n"
+            + ("\n\n".join(lines) if lines else "لا توجد رسائل حالية لهذه الخدمة."),
             rows,
         )
         return
 
-    match = re.fullmatch(r"ma_box_([0-9a-f]{12})_([0-9a-f]{16})_(\d+)", data)
-    if match:
-        code, email_key, page = match.group(1), match.group(2), int(match.group(3))
-        service = next((item for item in services if item["code"] == code), None)
-        if not service:
-            await display("⚠️ الخدمة غير متاحة.", [[back("ma_services_0")]])
-            return
-        entries, count = await asyncio.to_thread(
-            mail_analytics.read_service_email_messages,
-            get_db_connection, service["service"], email_key, page
-        )
-        rows = []
-        for item in entries:
-            sender = str(item["sender"] or "غير معروف")
-            label = f"✉️ {sender[:31]}"
-            rows.append([InlineKeyboardButton(
-                label, callback_data=f"ma_message_{item['id']}", transparent=True
-            )])
-        rows.extend(navigation(f"ma_box_{code}_{email_key}_", page, count))
-        rows.append([back(f"ma_service_{code}_0")])
-        if entries:
-            owner_id = entries[0]["owner_id"]
-            member = user_database.get(str(owner_id), {})
-            name = member.get("first_name") or "غير معروف"
-            username = "@" + member["username"] if member.get("username") else "—"
-            detail = (
-                f"📧 الإيميل: <code>{telegram_html(entries[0]['email_address'])}</code>\n"
-                f"👤 العضو: {telegram_html(name)} ({telegram_html(username)})\n"
-                f"🆔 ID: <code>{owner_id}</code>\n"
-            )
-        else:
-            detail = ""
+    # Old inline keyboards may still carry callbacks created by the former
+    # analytics view; do not permit them to expose message content.
+    if data.startswith(("ma_box_", "ma_message_")):
         await display(
-            f"📥 <b>رسائل {telegram_html(service['label'])}</b>\n"
-            + detail + f"✉️ العدد: {count}\n\n"
-            + ("اضغط على المرسل لعرض التفاصيل من mail.tm:" if count else
-               "ما في رسائل موجودة الآن."),
-            rows,
+            "ℹ️ تم تحديث قسم الإحصائيات. الآن يعرض الخدمة والعضو والإيميل والعدد فقط.",
+            [[back("ma_home")]]
         )
         return
-
-    match = re.fullmatch(r"ma_message_(\d+)", data)
-    if match:
-        row = await asyncio.to_thread(
-            mail_analytics.get_live_message, get_db_connection, int(match.group(1))
-        )
-        if not row:
-            await display("🗑️ الرسالة لم تعد موجودة في الفهرس.",
-                          [[back("ma_home")]])
-            return
-        owner_id = row["owner_id"]
-        address = str(row["email_address"])
-        emails = user_database.get(str(owner_id), {}).get("emails") or []
-        email_index = next((i for i, e in enumerate(emails)
-                            if str(e.get("address") or "").lower() == address), None)
-        back_to_box = (
-            f"ma_box_{mail_analytics.service_code(row['service'])}_{row['email_code'].strip()}_0"
-        )
-        if email_index is None:
-            await display("🗑️ هذا الإيميل لم يعد مرتبطاً بالعضو.",
-                          [[back("ma_home")]])
-            return
-        full = await asyncio.to_thread(
-            get_user_message_content, owner_id, email_index, row["message_id"]
-        )
-        if not full:
-            await display("🗑️ الرسالة غير متاحة حالياً على mail.tm.",
-                          [[back(back_to_box)]])
-            return
-        sender = (full.get("from") or {}).get("address") or "غير معروف"
-        content = get_message_text(full)
-        if len(content) > 3000:
-            content = content[:3000] + "\n\n… (تم اختصار الرسالة)"
-        await display(
-            "✉️ <b>تفاصيل الرسالة</b>\n\n"
-            f"📧 المستلم: <code>{telegram_html(address)}</code>\n"
-            f"👤 ID العضو: <code>{owner_id}</code>\n"
-            f"📤 المرسل: {telegram_html(sender)}\n"
-            f"📝 العنوان: {telegram_html(full.get('subject') or 'بدون عنوان')}\n"
-            f"📅 التاريخ: {telegram_html(full.get('createdAt') or 'غير معروف')}\n\n"
-            f"{telegram_html(content)}",
-            [[back(back_to_box)]],
-        )
 
 # ================== بيانات المستخدمين ==================
 
@@ -3964,7 +3999,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("ma_"):
         if not is_admin(user_id):
             return
-        await show_mail_analytics(query, data)
+        await show_mail_analytics(
+            query, data, context.application.bot_data.get("mail_analytics_status")
+        )
         return
 
     if data == "section_forward":
