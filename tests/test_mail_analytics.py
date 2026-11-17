@@ -183,3 +183,5 @@ class DashboardScannerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+# Validation-only: identical production code, run full suite on the main snapshot.
