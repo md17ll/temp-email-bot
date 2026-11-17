@@ -9,11 +9,16 @@ import re
 from collections import Counter
 from datetime import datetime, timezone
 
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, execute_values
 
 PAGE_SIZE = 8
 POLL_PAUSE_SECONDS = 3
-CYCLE_PAUSE_SECONDS = 90
+ACTIVE_HOURS = 12
+DORMANT_DAYS = 3
+SCHEDULER_WAKE_SECONDS = 30
+DUE_BATCH_SIZE = 50
+GLOBAL_429_PAUSE_SECONDS = 120
+MANUAL_SCAN_COOLDOWN_MINUTES = 20
 
 SERVICE_LABELS = {
     "facebook": "📘 فيسبوك",
@@ -130,6 +135,46 @@ def initialize(connect):
                     scanned_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS mail_analytics_schedule (
+                    email_address TEXT PRIMARY KEY,
+                    owner_id BIGINT NOT NULL DEFAULT 0,
+                    state TEXT NOT NULL DEFAULT 'new',
+                    last_checked_at TIMESTAMPTZ,
+                    next_check_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    last_error TEXT,
+                    failures INTEGER NOT NULL DEFAULT 0
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS mail_analytics_schedule_due_idx
+                ON mail_analytics_schedule(next_check_at, state)
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS mail_analytics_control (
+                    name TEXT PRIMARY KEY,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            # Reuse successful scans from before the scheduler existed. A
+            # redeploy must not recheck thousands of already scanned boxes.
+            cur.execute("""
+                INSERT INTO mail_analytics_schedule (
+                    email_address, owner_id, state, last_checked_at, next_check_at
+                )
+                SELECT scanned.email_address, 0,
+                       CASE WHEN EXISTS (
+                           SELECT 1 FROM mail_analytics_live live
+                           WHERE live.email_address = scanned.email_address
+                       ) THEN 'active' ELSE 'empty' END,
+                       scanned.scanned_at,
+                       scanned.scanned_at + CASE WHEN EXISTS (
+                           SELECT 1 FROM mail_analytics_live live
+                           WHERE live.email_address = scanned.email_address
+                       ) THEN INTERVAL '12 hours' ELSE INTERVAL '3 days' END
+                FROM mail_analytics_scans scanned
+                ON CONFLICT (email_address) DO NOTHING
+            """)
         conn.commit()
         return True
     except Exception as error:
@@ -140,7 +185,7 @@ def initialize(connect):
         conn.close()
 
 
-def save_mailbox_snapshot(connect, owner_id, address, messages):
+def save_mailbox_snapshot(connect, owner_id, address, messages, complete=True):
     """Commit a complete, successful mail.tm snapshot as a single transaction.
 
     Deleted messages lose all metadata here; cumulative counters and opaque
@@ -201,10 +246,11 @@ def save_mailbox_snapshot(connect, owner_id, address, messages):
                         received_at = EXCLUDED.received_at
                 """, (address, email_code(address), int(owner_id), message_id,
                       service, sender, received))
-            cur.execute("""
-                DELETE FROM mail_analytics_live
-                WHERE email_address = %s AND NOT (message_id = ANY(%s))
-            """, (address, visible_ids))
+            if complete:
+                cur.execute("""
+                    DELETE FROM mail_analytics_live
+                    WHERE email_address = %s AND NOT (message_id = ANY(%s))
+                """, (address, visible_ids))
             for service, count in new_counts.items():
                 cur.execute("""
                     INSERT INTO mail_analytics_totals (service, received_total)
@@ -219,11 +265,41 @@ def save_mailbox_snapshot(connect, owner_id, address, messages):
                     ON CONFLICT (event_date, service) DO UPDATE SET
                         received_total = mail_analytics_daily.received_total + EXCLUDED.received_total
                 """, (day, service, count))
+            if complete:
+                cur.execute("""
+                    INSERT INTO mail_analytics_scans (email_address, scanned_at)
+                    VALUES (%s, NOW())
+                    ON CONFLICT(email_address) DO UPDATE SET scanned_at = NOW()
+                """, (address,))
             cur.execute("""
-                INSERT INTO mail_analytics_scans (email_address, scanned_at)
-                VALUES (%s, NOW())
-                ON CONFLICT(email_address) DO UPDATE SET scanned_at = NOW()
+                SELECT EXISTS(SELECT 1 FROM mail_analytics_live WHERE email_address=%s)
             """, (address,))
+            has_messages = bool(cur.fetchone()[0])
+            # A partial manual inbox view may show 30 out of hundreds of mails.
+            # It must never purge other rows or count as the initial full scan.
+            cur.execute(
+                "SELECT EXISTS(SELECT 1 FROM mail_analytics_scans WHERE email_address=%s)",
+                (address,),
+            )
+            has_complete_scan = bool(cur.fetchone()[0])
+            interval = (
+                "0 minutes" if not has_complete_scan else
+                "12 hours" if has_messages else "3 days"
+            )
+            state = "active" if has_messages else "empty"
+            cur.execute("""
+                INSERT INTO mail_analytics_schedule
+                    (email_address, owner_id, state, last_checked_at,
+                     next_check_at, last_error, failures)
+                VALUES (%s, %s, %s, NOW(), NOW() + %s::interval, NULL, 0)
+                ON CONFLICT(email_address) DO UPDATE SET
+                    owner_id=EXCLUDED.owner_id,
+                    state=EXCLUDED.state,
+                    last_checked_at=EXCLUDED.last_checked_at,
+                    next_check_at=EXCLUDED.next_check_at,
+                    last_error=NULL,
+                    failures=0
+            """, (address, int(owner_id), state, interval))
         conn.commit()
         return True
     except Exception as error:
@@ -237,6 +313,8 @@ def save_mailbox_snapshot(connect, owner_id, address, messages):
 def purge_removed_emails(connect, addresses):
     """Remove live metadata for emails no longer owned by bot users."""
     active = sorted({str(address).lower() for address in addresses if address})
+    if not active:
+        return False  # Never mass-delete on a failed/empty user-data load.
     conn = connect()
     if not conn:
         return False
@@ -248,6 +326,10 @@ def purge_removed_emails(connect, addresses):
             )
             cur.execute(
                 "DELETE FROM mail_analytics_scans WHERE NOT (email_address = ANY(%s))",
+                (active,),
+            )
+            cur.execute(
+                "DELETE FROM mail_analytics_schedule WHERE NOT (email_address = ANY(%s))",
                 (active,),
             )
         conn.commit()
@@ -362,59 +444,273 @@ def get_live_message(connect, row_id):
         conn.close()
 
 
-async def monitor_mailboxes(connect, user_database, fetch_all, status=None):
-    """Inspect saved mailboxes gradually; failed requests never erase messages.
 
-    This is a background scanner. Status is process-local and only reports
-    diagnostics to authenticated bot admins; no passwords or message text.
+
+def sync_schedule(connect, mailbox_owners):
+    """Add newly created mailboxes without resetting any existing due dates.
+
+    Deleting a member email also removes live metadata and its scheduled scan;
+    aggregate historical totals remain untouched.
+    """
+    pairs = sorted({
+        (str(address).strip().lower(), int(owner_id))
+        for address, owner_id in mailbox_owners if address
+    })
+    if not pairs:
+        return False  # Fail safe if the member database could not be read.
+    addresses = [address for address, _ in pairs]
+    conn = connect()
+    if not conn:
+        return False
+    try:
+        with conn.cursor() as cur:
+            execute_values(cur, """
+                INSERT INTO mail_analytics_schedule(email_address, owner_id)
+                VALUES %s
+                ON CONFLICT(email_address) DO UPDATE
+                    SET owner_id=EXCLUDED.owner_id
+                WHERE mail_analytics_schedule.owner_id IS DISTINCT FROM EXCLUDED.owner_id
+            """, pairs, page_size=300)
+            cur.execute(
+                "DELETE FROM mail_analytics_live WHERE NOT (email_address = ANY(%s))",
+                (addresses,),
+            )
+            cur.execute(
+                "DELETE FROM mail_analytics_scans WHERE NOT (email_address = ANY(%s))",
+                (addresses,),
+            )
+            cur.execute(
+                "DELETE FROM mail_analytics_schedule WHERE NOT (email_address = ANY(%s))",
+                (addresses,),
+            )
+        conn.commit()
+        return True
+    except Exception as error:
+        conn.rollback()
+        print(f"⚠️ تعذر تحديث جدول المراقبة: {error}")
+        return False
+    finally:
+        conn.close()
+
+
+def scheduled_work(connect):
+    """Fetch a small due batch and category counts; one connection per wake."""
+    conn = connect()
+    if not conn:
+        return None
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT state, COUNT(*) AS total
+                FROM mail_analytics_schedule GROUP BY state
+            """)
+            categories = {row["state"]: int(row["total"]) for row in cur.fetchall()}
+            cur.execute("""
+                SELECT COUNT(*) AS total FROM mail_analytics_schedule
+                WHERE next_check_at <= NOW()
+            """)
+            due_count = int(cur.fetchone()["total"])
+            cur.execute("""
+                SELECT email_address, owner_id, state FROM mail_analytics_schedule
+                WHERE next_check_at <= NOW()
+                ORDER BY CASE WHEN state = 'new' THEN 0
+                              WHEN state = 'active' THEN 1 ELSE 2 END,
+                         next_check_at, email_address
+                LIMIT %s
+            """, (DUE_BATCH_SIZE,))
+            rows = [dict(row) for row in cur.fetchall()]
+            cur.execute("""
+                SELECT MIN(next_check_at) AS next_check FROM mail_analytics_schedule
+                WHERE next_check_at > NOW()
+            """)
+            next_check = cur.fetchone()["next_check"]
+        return {
+            "rows": rows, "due_count": due_count, "categories": categories,
+            "next_check": next_check,
+        }
+    except Exception as error:
+        print(f"⚠️ تعذر قراءة جدول المراقبة: {error}")
+        return None
+    finally:
+        conn.close()
+
+
+def defer_failed_mailbox(connect, owner_id, address, error_code):
+    """Persist failure backoff; never delete snapshots on a mail.tm failure."""
+    address = str(address or "").strip().lower()
+    error_code = str(error_code or "unknown")[:80]
+    if not address:
+        return False
+    conn = connect()
+    if not conn:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT failures FROM mail_analytics_schedule "
+                "WHERE email_address=%s FOR UPDATE", (address,)
+            )
+            prior = cur.fetchone()
+            failures = min(30, (int(prior[0]) if prior else 0) + 1)
+            if error_code in ("http_429", "rate_limited"):
+                minutes = min(360, 15 * (2 ** min(failures - 1, 5)))
+            elif error_code in ("token_invalid", "email_missing"):
+                minutes = DORMANT_DAYS * 24 * 60
+            else:
+                minutes = 12 * 60
+            cur.execute("""
+                INSERT INTO mail_analytics_schedule
+                    (email_address, owner_id, state, next_check_at, last_error, failures)
+                VALUES (%s, %s, 'error', NOW() + (%s * INTERVAL '1 minute'), %s, %s)
+                ON CONFLICT(email_address) DO UPDATE SET
+                    owner_id=EXCLUDED.owner_id,
+                    state='error',
+                    next_check_at=EXCLUDED.next_check_at,
+                    last_error=EXCLUDED.last_error,
+                    failures=EXCLUDED.failures
+            """, (address, int(owner_id), minutes, error_code, failures))
+        conn.commit()
+        return True
+    except Exception as error:
+        conn.rollback()
+        print(f"⚠️ تعذر حفظ تأجيل فحص البريد: {error}")
+        return False
+    finally:
+        conn.close()
+
+
+def request_full_scan(connect):
+    """Schedule a full scan; reject rapid repeat clicks even after a redeploy."""
+    conn = connect()
+    if not conn:
+        return False, "تعذر الاتصال بقاعدة البيانات"
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(81722, 2026)")
+            cur.execute(
+                "SELECT updated_at FROM mail_analytics_control "
+                "WHERE name='manual_full_scan'"
+            )
+            row = cur.fetchone()
+            now = datetime.now(timezone.utc)
+            if row and (now - row[0]).total_seconds() < MANUAL_SCAN_COOLDOWN_MINUTES * 60:
+                conn.rollback()
+                return False, f"تم طلب فحص شامل مؤخراً؛ انتظر {MANUAL_SCAN_COOLDOWN_MINUTES} دقيقة"
+            cur.execute("UPDATE mail_analytics_schedule SET next_check_at=NOW()")
+            scheduled = int(cur.rowcount)
+            if scheduled < 1:
+                conn.rollback()
+                return False, "لا توجد إيميلات محفوظة للفحص"
+            cur.execute("""
+                INSERT INTO mail_analytics_control(name, updated_at)
+                VALUES ('manual_full_scan', NOW())
+                ON CONFLICT(name) DO UPDATE SET updated_at=NOW()
+            """)
+        conn.commit()
+        return True, f"✅ تم جدولة فحص {scheduled} إيميل. سيبدأ تدريجياً."
+    except Exception as error:
+        conn.rollback()
+        print(f"⚠️ تعذر طلب الفحص الشامل: {error}")
+        return False, "تعذر جدولة الفحص الشامل"
+    finally:
+        conn.close()
+
+async def monitor_mailboxes(connect, user_database, fetch_all, status=None):
+    """Persistent 12-hour active / 72-hour dormant scheduler.
+
+    New emails are scanned once; empty boxes sleep three days; errors back off.
+    Manual full scans only change due times, never create a second worker.
     """
     status = status if status is not None else {}
+    known_owners = None
+    wave_active = False
     await asyncio.sleep(10)
     while True:
-        previous_cycle = int(status.get("cycle", 0))
         try:
-            mailboxes = []
+            mailbox_map = {}
             for uid, member in list(user_database.items()):
                 for index, record in enumerate(list(member.get("emails") or [])):
                     address = str(record.get("address") or "").strip().lower()
                     if address:
-                        mailboxes.append((int(uid), index, address))
-
-            status.update({
-                "state": "جاري الفحص",
-                "cycle": previous_cycle + 1,
-                "total": len(mailboxes),
-                "processed": 0,
-                "ok": 0,
-                "failed": 0,
-                "empty": 0,
-                "with_messages": 0,
-                "messages_found": 0,
-                "errors": {},
-                "examples": [],
-            })
-            await asyncio.to_thread(
-                purge_removed_emails, connect, [box[2] for box in mailboxes]
-            )
-
-            for uid, index, address in mailboxes:
-                latest = user_database.get(str(uid), {}).get("emails") or []
-                if index >= len(latest) or str(latest[index].get("address") or "").lower() != address:
-                    result = {"messages": None, "error": "email_changed"}
+                        mailbox_map[address] = (int(uid), index)
+            pairs = {(address, uid) for address, (uid, _) in mailbox_map.items()}
+            if pairs and pairs != known_owners:
+                synced = await asyncio.to_thread(sync_schedule, connect, list(pairs))
+                if synced:
+                    known_owners = pairs
                 else:
-                    try:
-                        result = await asyncio.to_thread(fetch_all, uid, index)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as error:
-                        print(f"⚠️ فشل فحص صندوق عضو {uid}: {type(error).__name__}")
-                        result = {"messages": None, "error": "unexpected_error"}
+                    status["state"] = "تعذر مزامنة جدول الفحص"
+                    await asyncio.sleep(SCHEDULER_WAKE_SECONDS)
+                    continue
+
+            work = await asyncio.to_thread(scheduled_work, connect)
+            if work is None:
+                status["state"] = "تعذر قراءة مواعيد الفحص"
+                await asyncio.sleep(SCHEDULER_WAKE_SECONDS)
+                continue
+
+            status["categories"] = work["categories"]
+            status["next_check"] = work["next_check"]
+            due = work["due_count"]
+
+            if not due:
+                if wave_active:
+                    status["state"] = "اكتملت الدورة"
+                    status["last_completed"] = datetime.now(timezone.utc).strftime(
+                        "%Y-%m-%d %H:%M UTC"
+                    )
+                    wave_active = False
+                    status["wave_active"] = False
+                else:
+                    status["state"] = "بانتظار موعد الفحص"
+                status["pending_due"] = 0
+                await asyncio.sleep(SCHEDULER_WAKE_SECONDS)
+                continue
+
+            if not wave_active:
+                wave_active = True
+                status.update({
+                    "state": "جاري الفحص الذكي",
+                    "wave_active": True,
+                    "cycle": int(status.get("cycle", 0)) + 1,
+                    "total": due,
+                    "processed": 0,
+                    "ok": 0,
+                    "failed": 0,
+                    "empty": 0,
+                    "with_messages": 0,
+                    "messages_found": 0,
+                    "errors": {},
+                    "examples": [],
+                })
+            status["state"] = "جاري الفحص الذكي"
+            status["total"] = max(
+                int(status.get("total") or 0),
+                int(status.get("processed") or 0) + due,
+            )
+            status["pending_due"] = due
+            for row in work["rows"]:
+                address = row["email_address"]
+                owner_id = int(row["owner_id"])
+                owner_and_index = mailbox_map.get(address)
+                if not owner_and_index or owner_and_index[0] != owner_id:
+                    # A recently deleted email must not trigger a network call.
+                    await asyncio.to_thread(sync_schedule, connect, list(pairs))
+                    status["processed"] += 1
+                    continue
+                uid, index = owner_and_index
+                try:
+                    result = await asyncio.to_thread(fetch_all, uid, index)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    print(f"⚠️ خطأ فحص البريد للعضو {uid}: {type(error).__name__}")
+                    result = {"messages": None, "error": "unexpected_error"}
 
                 if isinstance(result, dict):
                     messages = result.get("messages")
                     error_code = str(result.get("error") or "mailbox_error")
                 else:
-                    # Accept the legacy scanner return type for compatibility.
                     messages = result
                     error_code = "mailbox_error"
 
@@ -430,25 +726,31 @@ async def monitor_mailboxes(connect, user_database, fetch_all, status=None):
                         else:
                             status["empty"] += 1
                     else:
-                        error_code = "database_error"
                         messages = None
+                        error_code = "database_error"
 
                 if not isinstance(messages, list):
+                    await asyncio.to_thread(
+                        defer_failed_mailbox, connect, uid, address, error_code
+                    )
                     status["failed"] += 1
-                    error_counts = status["errors"]
-                    error_counts[error_code] = int(error_counts.get(error_code, 0)) + 1
+                    errors = status["errors"]
+                    errors[error_code] = int(errors.get(error_code, 0)) + 1
                     if len(status["examples"]) < 8:
                         status["examples"].append({
-                            "owner_id": uid, "email": address, "error": error_code
+                            "owner_id": uid, "email": address,
+                            "error": error_code,
                         })
                 status["processed"] += 1
                 await asyncio.sleep(POLL_PAUSE_SECONDS)
-
-            status["state"] = "اكتملت الدورة"
-            status["last_completed"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                if error_code in ("http_429", "rate_limited"):
+                    # Cooling down the entire scanner prevents cascading 429s.
+                    status["state"] = "تهدئة ضغط mail.tm"
+                    await asyncio.sleep(GLOBAL_429_PAUSE_SECONDS)
+                    status["state"] = "جاري الفحص الذكي"
         except asyncio.CancelledError:
             raise
         except Exception as error:
             status["state"] = "تعثر الفحص"
-            print(f"⚠️ دورة فحص البريد لم تكتمل: {type(error).__name__}: {error}")
-        await asyncio.sleep(CYCLE_PAUSE_SECONDS)
+            print(f"⚠️ دورة الفحص الذكي: {type(error).__name__}: {error}")
+            await asyncio.sleep(SCHEDULER_WAKE_SECONDS)
