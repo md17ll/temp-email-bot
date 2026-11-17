@@ -1588,6 +1588,29 @@ def refresh_user_email_token(user_id: int, email_index: int):
     return refresh_user_email_token_detailed(user_id, email_index).get("token")
 
 
+
+def record_manual_inbox_analytics(user_id, email_data, result):
+    """Reuse the user's ordinary inbox request; do not fetch mail.tm twice.
+
+    The normal inbox endpoint may return only its first page, so its results
+    are *partial*. Never use a partial view to erase other indexed messages.
+    An empty first page, however, is a complete empty mailbox.
+    """
+    if result.get("error") is not None or not isinstance(result.get("messages"), list):
+        return result
+    address = str(email_data.get("address") or "").strip()
+    if not address:
+        return result
+    messages = result["messages"]
+    try:
+        mail_analytics.save_mailbox_snapshot(
+            get_db_connection, user_id, address, messages, complete=(len(messages) == 0)
+        )
+    except Exception as error:
+        print(f"⚠️ تعذر تحديث الإحصائيات من فحص العضو: {type(error).__name__}")
+    return result
+
+
 def check_user_inbox_detailed(user_id: int, email_index: int):
     """فحص الصندوق وتجديد الجلسة مرة واحدة مع الحفاظ على سبب الفشل الحقيقي."""
     emails = get_user_emails(user_id)
@@ -1597,7 +1620,7 @@ def check_user_inbox_detailed(user_id: int, email_index: int):
     email_data = emails[email_index]
     result = check_inbox_detailed(email_data.get("token"))
     if result.get("error") != "token_invalid":
-        return result
+        return record_manual_inbox_analytics(user_id, email_data, result)
 
     refresh_result = refresh_user_email_token_detailed(user_id, email_index)
     new_token = refresh_result.get("token")
@@ -1621,7 +1644,7 @@ def check_user_inbox_detailed(user_id: int, email_index: int):
 
     retry_result = check_inbox_detailed(new_token)
     retry_result["token_refreshed"] = retry_result.get("error") is None
-    return retry_result
+    return record_manual_inbox_analytics(user_id, email_data, retry_result)
 
 def get_user_message_content(user_id: int, email_index: int, message_id: str):
     """تحميل رسالة كاملة، مع تجديد التوكن تلقائياً إذا انتهى أثناء الفتح."""
@@ -1913,6 +1936,8 @@ async def start_mail_analytics(application):
         "messages_found": 0,
         "errors": {},
         "examples": [],
+        "categories": {},
+        "wave_active": False,
     }
     application.bot_data["mail_analytics_status"] = scan_status
     ok = await asyncio.to_thread(mail_analytics.initialize, get_db_connection)
@@ -1984,6 +2009,8 @@ async def show_mail_analytics(query, data: str, scan_status=None):
         total = int(scan_status.get("total") or 0)
         passed = int(scan_status.get("ok") or 0)
         failed = int(scan_status.get("failed") or 0)
+        categories = scan_status.get("categories") or {}
+        notice = scan_status.pop("notice", "")
         text = (
             "📬 <b>إحصائيات الرسائل</b>\n\n"
             f"📨 وصل إجمالاً منذ بدء التسجيل: <b>{int(overview['lifetime'])}</b>\n"
@@ -1997,7 +2024,13 @@ async def show_mail_analytics(query, data: str, scan_status=None):
             f"📊 فُحص {scanned} من {total} | ✅ {passed} | ❌ {failed}\n"
             f"⏳ المتبقية: {max(0, total - scanned)}\n"
             f"🕓 آخر فحص ناجح: {telegram_html(last_text)}\n\n"
-            "ℹ️ العدد التاريخي يشمل فقط الرسائل التي رصدها النظام، "
+            "<b>🧠 نظام الفحص الذكي</b>\n"
+            f"📬 نشطة (كل 12 ساعة): {int(categories.get('active') or 0)}\n"
+            f"📭 فارغة (كل 3 أيام): {int(categories.get('empty') or 0)}\n"
+            f"🔑 أخطاء مؤجلة: {int(categories.get('error') or 0)}\n"
+            f"🆕 بانتظار الفحص الأول: {int(categories.get('new') or 0)}\n\n"
+            + (f"📣 {telegram_html(notice)}\n\n" if notice else "")
+            + "ℹ️ العدد التاريخي يشمل فقط الرسائل التي رصدها النظام، "
             "وليس الرسائل المحذوفة قبل تفعيله. "
             "تفاصيل الرسائل لا تظهر بهذا القسم."
         )
@@ -2007,6 +2040,9 @@ async def show_mail_analytics(query, data: str, scan_status=None):
             )],
             [InlineKeyboardButton(
                 "🩺 تفاصيل الفحص", callback_data="ma_diagnostics", transparent=True
+            )],
+            [InlineKeyboardButton(
+                "🔄 فحص شامل الآن", callback_data="ma_scan_all", transparent=True
             )],
             [InlineKeyboardButton(
                 "🔄 تحديث الإحصائيات", callback_data="ma_home", transparent=True
@@ -2033,6 +2069,9 @@ async def show_mail_analytics(query, data: str, scan_status=None):
             f"{telegram_html(item['error'])}"
             for item in examples
         ]
+        categories = scan_status.get("categories") or {}
+        next_check = scan_status.get("next_check")
+        due_time = next_check.strftime("%Y-%m-%d %H:%M UTC") if next_check else "لا يوجد موعد بعد"
         text = (
             "🩺 <b>تشخيص فحص mail.tm</b>\n\n"
             f"⚙️ الحالة: {status_name}\n"
@@ -2044,9 +2083,15 @@ async def show_mail_analytics(query, data: str, scan_status=None):
             f"📬 صناديق فيها رسائل: {int(scan_status.get('with_messages') or 0)}\n"
             f"📨 رسائل ظهرت بالدورة: {int(scan_status.get('messages_found') or 0)}\n"
             f"❌ فشل فحصها: {failures}\n"
-            f"⏳ المتبقية: {max(0, total - processed)}\n"
+            f"⏳ المتبقية بالدورة: {max(0, total - processed)}\n"
             f"🕓 آخر دورة مكتملة: {telegram_html(scan_status.get('last_completed') or 'لم تكتمل بعد')}\n\n"
-            "<b>أسباب الأخطاء</b>\n"
+            "<b>🧠 الجدولة المحفوظة</b>\n"
+            f"📬 الإيميلات النشطة (12 ساعة): {int(categories.get('active') or 0)}\n"
+            f"📭 الفارغة (3 أيام): {int(categories.get('empty') or 0)}\n"
+            f"🔑 الأخطاء المؤجلة: {int(categories.get('error') or 0)}\n"
+            f"🆕 بانتظار أول فحص: {int(categories.get('new') or 0)}\n"
+            f"⏰ أقرب فحص مجدول: {telegram_html(due_time)}\n\n"
+            "<b>أسباب الأخطاء بالدورة</b>\n"
             + ("\n".join(issue_lines) if issue_lines else "لا توجد أخطاء مسجلة بالدورة.")
             + "\n\n<b>أمثلة على الإيميلات التي تعذّر فحصها</b>\n"
             + ("\n".join(detail_lines) if detail_lines else "لا يوجد.")
@@ -3999,9 +4044,19 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("ma_"):
         if not is_admin(user_id):
             return
-        await show_mail_analytics(
-            query, data, context.application.bot_data.get("mail_analytics_status")
-        )
+        scan_status = context.application.bot_data.get("mail_analytics_status") or {}
+        if data == "ma_scan_all":
+            if scan_status.get("wave_active"):
+                scan_status["notice"] = "يوجد فحص جاري. لا يمكن تشغيل فحص شامل ثانٍ فوقه."
+            else:
+                ok, message = await asyncio.to_thread(
+                    mail_analytics.request_full_scan, get_db_connection
+                )
+                scan_status["notice"] = message
+                if ok:
+                    scan_status["state"] = "تمت جدولة فحص شامل"
+            data = "ma_home"
+        await show_mail_analytics(query, data, scan_status)
         return
 
     if data == "section_forward":

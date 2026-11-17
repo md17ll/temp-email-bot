@@ -1,6 +1,6 @@
 import os
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import psycopg2
 import mail_analytics as analytics
@@ -39,7 +39,8 @@ class DatabaseTests(unittest.TestCase):
             with conn.cursor() as cur:
                 cur.execute("TRUNCATE mail_analytics_live, mail_analytics_seen,"
                             " mail_analytics_totals, mail_analytics_daily,"
-                            " mail_analytics_scans RESTART IDENTITY")
+                            " mail_analytics_scans, mail_analytics_schedule,"
+                            " mail_analytics_control RESTART IDENTITY")
 
     def test_discovery_deduplication_and_deletion(self):
         address = "test@mail.tm"
@@ -93,10 +94,141 @@ class DatabaseTests(unittest.TestCase):
     def test_deleting_email_removes_only_live_records(self):
         self.assertTrue(analytics.save_mailbox_snapshot(connect, 432,
                          "test2@mail.tm", [{"id": "x", "from": {"address": "hi@discord.com"}}]))
-        self.assertTrue(analytics.purge_removed_emails(connect, []))
+        # Empty member load is ambiguous and must never wipe live data.
+        self.assertFalse(analytics.purge_removed_emails(connect, []))
+        self.assertEqual(analytics.read_overview(connect)["available"], 1)
+        # Deleting this email while another mailbox remains is a valid cleanup.
+        self.assertTrue(analytics.purge_removed_emails(connect, ["kept@mail.tm"]))
         overview = analytics.read_overview(connect)
         self.assertEqual(overview["lifetime"], 1)
         self.assertEqual(overview["available"], 0)
+
+
+
+
+class SmartScheduleDatabaseTests(DatabaseTests):
+    """Isolated PostgreSQL scheduler tests: no API calls or production writes."""
+
+    def test_initial_scan_only_once_after_redeploy(self):
+        address = "firstscan@mail.tm"
+        self.assertTrue(analytics.sync_schedule(connect, [(address, 123)]))
+        work = analytics.scheduled_work(connect)
+        self.assertEqual(work["due_count"], 1)
+        self.assertEqual(work["rows"][0]["state"], "new")
+
+        self.assertTrue(analytics.save_mailbox_snapshot(connect, 123, address, []))
+        self.assertEqual(analytics.scheduled_work(connect)["due_count"], 0)
+        self.assertEqual(analytics.scheduled_work(connect)["categories"]["empty"], 1)
+        self.assertTrue(analytics.initialize(connect))
+        self.assertTrue(analytics.sync_schedule(connect, [(address, 123)]))
+        self.assertEqual(analytics.scheduled_work(connect)["due_count"], 0)
+
+    def test_active_12_hours_and_empty_72_hours(self):
+        address = "active@mail.tm"
+        self.assertTrue(analytics.sync_schedule(connect, [(address, 12)]))
+        self.assertTrue(analytics.save_mailbox_snapshot(connect, 12, address, [
+            {"id": "msg-a", "from": {"address": "notify@facebookmail.com"}},
+        ]))
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT state, next_check_at - NOW()
+                    FROM mail_analytics_schedule WHERE email_address=%s
+                """, (address,))
+                state, due_in = cur.fetchone()
+        self.assertEqual(state, "active")
+        self.assertTrue(timedelta(hours=11) < due_in <= timedelta(hours=12))
+
+        self.assertTrue(analytics.save_mailbox_snapshot(connect, 12, address, []))
+        self.assertEqual(analytics.read_overview(connect)["available"], 0)
+        self.assertEqual(analytics.read_overview(connect)["lifetime"], 1)
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT state, next_check_at - NOW()
+                    FROM mail_analytics_schedule WHERE email_address=%s
+                """, (address,))
+                state, due_in = cur.fetchone()
+        self.assertEqual(state, "empty")
+        self.assertTrue(timedelta(days=2, hours=23) < due_in <= timedelta(days=3))
+
+    def test_partial_member_inbox_never_erases_other_messages(self):
+        address = "member@mail.tm"
+        first = {"id": "first", "from": {"address": "hello@facebookmail.com"}}
+        second = {"id": "second", "from": {"address": "hello@discord.com"}}
+        self.assertTrue(analytics.sync_schedule(connect, [(address, 15)]))
+        self.assertTrue(analytics.save_mailbox_snapshot(
+            connect, 15, address, [first], complete=False
+        ))
+        # No successful complete scan yet: keep it due right now.
+        self.assertEqual(analytics.scheduled_work(connect)["due_count"], 1)
+        self.assertTrue(analytics.save_mailbox_snapshot(connect, 15, address, [first, second]))
+        self.assertEqual(analytics.read_overview(connect)["available"], 2)
+        self.assertTrue(analytics.save_mailbox_snapshot(
+            connect, 15, address, [first], complete=False
+        ))
+        self.assertEqual(analytics.read_overview(connect)["available"], 2)
+        self.assertEqual(analytics.read_overview(connect)["lifetime"], 2)
+
+    def test_token_invalid_is_deferred_and_429_has_backoff(self):
+        address = "bad@mail.tm"
+        self.assertTrue(analytics.sync_schedule(connect, [(address, 77)]))
+        self.assertTrue(analytics.defer_failed_mailbox(connect, 77, address, "token_invalid"))
+        self.assertEqual(analytics.scheduled_work(connect)["due_count"], 0)
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT next_check_at - NOW()
+                    FROM mail_analytics_schedule WHERE email_address=%s
+                """, (address,))
+                delay = cur.fetchone()[0]
+        self.assertTrue(timedelta(days=2, hours=23) < delay <= timedelta(days=3))
+        self.assertTrue(analytics.defer_failed_mailbox(connect, 77, address, "http_429"))
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT failures, next_check_at - NOW()
+                    FROM mail_analytics_schedule WHERE email_address=%s
+                """, (address,))
+                failures, delay = cur.fetchone()
+        self.assertEqual(failures, 2)
+        self.assertTrue(timedelta(minutes=29) < delay <= timedelta(minutes=30))
+
+    def test_manual_full_scan_and_click_cooldown(self):
+        address = "full@mail.tm"
+        self.assertTrue(analytics.sync_schedule(connect, [(address, 55)]))
+        self.assertTrue(analytics.save_mailbox_snapshot(connect, 55, address, []))
+        self.assertEqual(analytics.scheduled_work(connect)["due_count"], 0)
+        accepted, detail = analytics.request_full_scan(connect)
+        self.assertTrue(accepted, detail)
+        self.assertEqual(analytics.scheduled_work(connect)["due_count"], 1)
+        accepted, detail = analytics.request_full_scan(connect)
+        self.assertFalse(accepted)
+        self.assertIn("انتظر", detail)
+
+    def test_deletion_cleanup_retains_historical_total(self):
+        address = "delete@mail.tm"
+        self.assertTrue(analytics.sync_schedule(connect, [(address, 45)]))
+        self.assertTrue(analytics.save_mailbox_snapshot(connect, 45, address, [
+            {"id": "once", "from": {"address": "notice@google.com"}}
+        ]))
+        self.assertTrue(analytics.sync_schedule(connect, [("other@mail.tm", 99)]))
+        self.assertEqual(analytics.read_overview(connect)["lifetime"], 1)
+        self.assertEqual(analytics.read_overview(connect)["available"], 0)
+        self.assertEqual(analytics.scheduled_work(connect)["categories"], {"new": 1})
+
+    def test_migrate_prior_scan_timestamps(self):
+        address = "existing@mail.tm"
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO mail_analytics_scans(email_address, scanned_at) "
+                    "VALUES (%s, NOW())", (address,)
+                )
+        self.assertTrue(analytics.initialize(connect))
+        self.assertTrue(analytics.sync_schedule(connect, [(address, 5)]))
+        self.assertEqual(analytics.scheduled_work(connect)["due_count"], 0)
+        self.assertEqual(analytics.scheduled_work(connect)["categories"]["empty"], 1)
 
 
 
@@ -178,6 +310,8 @@ class DashboardScannerTests(unittest.TestCase):
         self.assertNotIn("get_message_text", dashboard)
         self.assertIn("ma_diagnostics", dashboard)
         self.assertIn("🆔 ID:", dashboard)
+        self.assertIn("ma_scan_all", dashboard)
+        self.assertIn("كل 12 ساعة", dashboard)
         self.assertIn('callback_data=f"member_msg_', source)
         self.assertIn("get_user_message_content, target_id", source)
 
