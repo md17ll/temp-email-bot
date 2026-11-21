@@ -66,6 +66,18 @@ MAIL_REQUEST_MAX_PER_SECOND = 6
 MAIL_REQUEST_WINDOW_SECONDS = 1.0
 MAIL_REQUEST_TIMESTAMPS = deque()
 MAIL_REQUEST_LOCK = threading.Lock()
+# Each blocking worker reuses its own safe keep-alive connection to mail.tm.
+_MAIL_HTTP_LOCAL = threading.local()
+
+
+def _mail_session():
+    session = getattr(_MAIL_HTTP_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=2, pool_maxsize=2)
+        session.mount("https://", adapter)
+        _MAIL_HTTP_LOCAL.session = session
+    return session
 DEFAULT_SUBSCRIPTION_MESSAGE = (
     "⚠️ يجب عليك الاشتراك في القنوات التالية لاستخدام البوت:\n\n"
     "بعد الاشتراك في جميع القنوات اضغط: ✅ التحقق من الاشتراك"
@@ -905,7 +917,10 @@ def find_user_by_username_or_id(search_value: str):
             if row:
                 user_id = int(row["telegram_id"])
                 info = _db_row_to_user_info(row)
+                previous = user_database.get(str(user_id), {})
                 user_database[str(user_id)] = info
+                if previous.get("emails") != info.get("emails"):
+                    mail_analytics.notify_schedule_change(owners_changed=True)
                 return user_id, info
         except Exception as error:
             print(f"⚠️ فشل البحث عن العضو في قاعدة البيانات: {error}")
@@ -961,6 +976,7 @@ def clear_user_emails(user_id: int):
         info["emails"] = []
         user_database[str(user_id)] = info
         delete_email_seen_records(addresses)
+        mail_analytics.notify_schedule_change(owners_changed=True)
         return True, len(old_emails)
     except Exception as error:
         print(f"❌ فشل حذف إيميلات العضو من قاعدة البيانات: {error}")
@@ -1231,10 +1247,11 @@ def get_channel_subscription_stats():
 
 # ================== اشتراك إجباري متعدد ==================
 
-async def get_missing_subscription_channels(user_id: int, context: ContextTypes.DEFAULT_TYPE):
+async def get_missing_subscription_channels(user_id: int, context: ContextTypes.DEFAULT_TYPE, channels=None):
     """يرجع القنوات المفعّلة التي لم يشترك بها العضو بعد."""
     missing = []
-    channels = get_channels(only_enabled=True)
+    if channels is None:
+        channels = get_channels(only_enabled=True)
 
     for channel_info in channels:
         channel_username = channel_info["channel_username"]
@@ -1340,7 +1357,7 @@ def mail_request(method: str, path: str, return_error=False, **kwargs):
     for attempt in range(3):
         try:
             wait_for_mail_request_slot()
-            response = requests.request(
+            response = _mail_session().request(
                 method,
                 f"{API}{path}",
                 timeout=(5, 20),
@@ -2206,10 +2223,17 @@ def update_user_info(user_id, user):
     if user is None:
         return
     data = get_user_data(user_id)
-    data["lang"] = "ar"
-    data["first_name"] = user.first_name or ""
-    data["last_name"] = user.last_name or ""
-    data["username"] = user.username or ""
+    changes = {
+        "lang": "ar",
+        "first_name": user.first_name or "",
+        "last_name": user.last_name or "",
+        "username": user.username or "",
+    }
+    # Incoming texts do not change a member's name or emails. Avoid rewriting
+    # the member's whole JSONB mailbox list for every ordinary message.
+    if all(data.get(key, "") == value for key, value in changes.items()):
+        return
+    data.update(changes)
     user_database[str(user_id)] = data
     save_single_user(str(user_id), data)
 
@@ -2233,7 +2257,8 @@ def add_user_email(user_id, email, token, password=None):
         email_record["password"] = password
     data.setdefault("emails", []).append(email_record)
     user_database[str(user_id)] = data
-    save_single_user(str(user_id), data)
+    if save_single_user(str(user_id), data):
+        mail_analytics.notify_schedule_change(owners_changed=True)
 
 
 def remove_user_email(user_id, email):
@@ -2242,6 +2267,7 @@ def remove_user_email(user_id, email):
     user_database[str(user_id)] = data
     if save_single_user(str(user_id), data):
         delete_email_seen_records([email])
+        mail_analytics.notify_schedule_change(owners_changed=True)
 
 async def notify_admin_new_user(context: ContextTypes.DEFAULT_TYPE, user) -> None:
     """إشعار المشرف الرئيسي مرة واحدة عند دخول عضو جديد للبوت."""
@@ -2740,7 +2766,9 @@ async def guard_user(update_or_query, context, user_id: int, lang: str) -> bool:
     # اشتراك صارم بكل القنوات المفعّلة (لغير الأدمن)
     if not admin_user:
         active_channels = get_channels(only_enabled=True)
-        missing_channels = await get_missing_subscription_channels(user_id, context)
+        missing_channels = await get_missing_subscription_channels(
+            user_id, context, channels=active_channels
+        )
         if missing_channels:
             text, kb = subscription_prompt(lang, missing_channels)
             if hasattr(update_or_query, "message") and update_or_query.message:
@@ -4055,6 +4083,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 scan_status["notice"] = message
                 if ok:
                     scan_status["state"] = "تمت جدولة فحص شامل"
+                    mail_analytics.notify_schedule_change()
             data = "ma_home"
         await show_mail_analytics(query, data, scan_status)
         return
@@ -5368,6 +5397,7 @@ def main():
         Application.builder().token(token)
         .post_init(start_mail_analytics)
         .post_shutdown(stop_mail_analytics)
+        .job_queue(None)  # No scheduled Telegram jobs are used by this bot.
         .build()
     )
     # المجموعة -1 تلتقط كل الرسائل الخاصة أولاً، بما فيها /start وباقي الأوامر والوسائط،

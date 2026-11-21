@@ -6,6 +6,8 @@ Only a hash of each previously observed message survives mail.tm deletion.
 import asyncio
 import hashlib
 import re
+import threading
+import time
 from collections import Counter
 from datetime import datetime, timezone
 
@@ -15,7 +17,50 @@ PAGE_SIZE = 8
 POLL_PAUSE_SECONDS = 3
 ACTIVE_HOURS = 12
 DORMANT_DAYS = 3
-SCHEDULER_WAKE_SECONDS = 30
+# Maximum idle reconciliation; exact due dates can wake the worker sooner.
+SCHEDULER_IDLE_RECHECK_SECONDS = 600
+SCHEDULER_ERROR_RETRY_SECONDS = 30
+_WAKE_LOCK = threading.Lock()
+_WAKE_LOOP = None
+_WAKE_EVENT = None
+_OWNER_REVISION = 0
+
+
+def notify_schedule_change(owners_changed=False):
+    """Wake the one existing scanner without starting another task."""
+    global _OWNER_REVISION
+    with _WAKE_LOCK:
+        if owners_changed:
+            _OWNER_REVISION += 1
+        loop, event = _WAKE_LOOP, _WAKE_EVENT
+    if loop is not None and event is not None and not loop.is_closed():
+        try:
+            loop.call_soon_threadsafe(event.set)
+        except RuntimeError:
+            pass
+
+
+async def _idle_wait(event, delay):
+    try:
+        await asyncio.wait_for(event.wait(), timeout=max(0.25, float(delay)))
+    except asyncio.TimeoutError:
+        pass
+    finally:
+        event.clear()
+
+
+def _next_idle_delay(next_check, now=None):
+    """Respect the next PostgreSQL deadline without polling every 30 seconds."""
+    now = now or datetime.now(timezone.utc)
+    if next_check is None:
+        return SCHEDULER_IDLE_RECHECK_SECONDS
+    if next_check.tzinfo is None:
+        next_check = next_check.replace(tzinfo=timezone.utc)
+    return max(0.25, min(
+        SCHEDULER_IDLE_RECHECK_SECONDS,
+        (next_check - now).total_seconds(),
+    ))
+
 DUE_BATCH_SIZE = 50
 GLOBAL_429_PAUSE_SECONDS = 120
 MANUAL_SCAN_COOLDOWN_MINUTES = 20
@@ -203,12 +248,16 @@ def save_mailbox_snapshot(connect, owner_id, address, messages, complete=True):
         visible_ids = []
         unique_messages = set()
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT message_id FROM mail_analytics_live "
-                "WHERE email_address=%s AND owner_id=%s",
-                (address, int(owner_id)),
-            )
-            already_live = {row[0] for row in cur.fetchall()}
+            if messages:
+                cur.execute(
+                    "SELECT message_id FROM mail_analytics_live "
+                    "WHERE email_address=%s AND owner_id=%s",
+                    (address, int(owner_id)),
+                )
+                already_live = {row[0] for row in cur.fetchall()}
+            else:
+                # Empty boxes are the overwhelming majority. No SELECT is needed.
+                already_live = set()
             for item in messages:
                 if not isinstance(item, dict) or item.get("isDeleted") is True:
                     continue
@@ -271,17 +320,21 @@ def save_mailbox_snapshot(connect, owner_id, address, messages, complete=True):
                     VALUES (%s, NOW())
                     ON CONFLICT(email_address) DO UPDATE SET scanned_at = NOW()
                 """, (address,))
-            cur.execute("""
-                SELECT EXISTS(SELECT 1 FROM mail_analytics_live WHERE email_address=%s)
-            """, (address,))
-            has_messages = bool(cur.fetchone()[0])
-            # A partial manual inbox view may show 30 out of hundreds of mails.
-            # It must never purge other rows or count as the initial full scan.
-            cur.execute(
-                "SELECT EXISTS(SELECT 1 FROM mail_analytics_scans WHERE email_address=%s)",
-                (address,),
-            )
-            has_complete_scan = bool(cur.fetchone()[0])
+            if complete:
+                # The transaction has already reconciled exactly these IDs.
+                has_messages = bool(visible_ids)
+                has_complete_scan = True
+            else:
+                # A partial manual inbox view may show just its first page.
+                # Never delete other messages or mark a first scan complete.
+                cur.execute("""
+                    SELECT EXISTS(
+                        SELECT 1 FROM mail_analytics_live WHERE email_address=%s
+                    ), EXISTS(
+                        SELECT 1 FROM mail_analytics_scans WHERE email_address=%s
+                    )
+                """, (address, address))
+                has_messages, has_complete_scan = map(bool, cur.fetchone())
             interval = (
                 "0 minutes" if not has_complete_scan else
                 "12 hours" if has_messages else "3 days"
@@ -616,37 +669,63 @@ def request_full_scan(connect):
         conn.close()
 
 async def monitor_mailboxes(connect, user_database, fetch_all, status=None):
-    """Persistent 12-hour active / 72-hour dormant scheduler.
+    """One persistent scanner: wake on changes, due dates, or periodic fallback.
 
-    New emails are scanned once; empty boxes sleep three days; errors back off.
-    Manual full scans only change due times, never create a second worker.
+    Active boxes still scan every 12h, empty boxes every 72h. No parallel tasks.
     """
+    global _WAKE_LOOP, _WAKE_EVENT
     status = status if status is not None else {}
+    wake = asyncio.Event()
+    with _WAKE_LOCK:
+        _WAKE_LOOP = asyncio.get_running_loop()
+        _WAKE_EVENT = wake
     known_owners = None
+    mailbox_map = {}
+    pairs = set()
+    last_owner_check = 0.0
+    last_owner_revision = -1
     wave_active = False
     await asyncio.sleep(10)
     while True:
         try:
-            mailbox_map = {}
-            for uid, member in list(user_database.items()):
-                for index, record in enumerate(list(member.get("emails") or [])):
-                    address = str(record.get("address") or "").strip().lower()
-                    if address:
-                        mailbox_map[address] = (int(uid), index)
-            pairs = {(address, uid) for address, (uid, _) in mailbox_map.items()}
-            if pairs and pairs != known_owners:
-                synced = await asyncio.to_thread(sync_schedule, connect, list(pairs))
-                if synced:
+            with _WAKE_LOCK:
+                revision = _OWNER_REVISION
+            if (
+                known_owners is None
+                or revision != last_owner_revision
+                or time.monotonic() - last_owner_check >= SCHEDULER_IDLE_RECHECK_SECONDS
+            ):
+                # Rebuilding thousands of email dictionaries only when necessary
+                # avoids thousands of needless iterations per day.
+                mailbox_map = {}
+                for uid, member in list(user_database.items()):
+                    for index, record in enumerate(list(member.get("emails") or [])):
+                        address = str(record.get("address") or "").strip().lower()
+                        if address:
+                            mailbox_map[address] = (int(uid), index)
+                pairs = {(address, uid) for address, (uid, _) in mailbox_map.items()}
+                if pairs and pairs != known_owners:
+                    synced = await asyncio.to_thread(sync_schedule, connect, list(pairs))
+                    if not synced:
+                        status["state"] = "تعذر مزامنة جدول الفحص"
+                        await asyncio.sleep(SCHEDULER_ERROR_RETRY_SECONDS)
+                        continue
                     known_owners = pairs
-                else:
-                    status["state"] = "تعذر مزامنة جدول الفحص"
-                    await asyncio.sleep(SCHEDULER_WAKE_SECONDS)
-                    continue
+                last_owner_revision = revision
+                last_owner_check = time.monotonic()
+
+            if not pairs:
+                # Never spin on due rows from mailboxes that no longer exist.
+                # Keep stored rows intact if loading member data temporarily failed.
+                status["state"] = "بانتظار موعد الفحص"
+                status["pending_due"] = 0
+                await _idle_wait(wake, SCHEDULER_IDLE_RECHECK_SECONDS)
+                continue
 
             work = await asyncio.to_thread(scheduled_work, connect)
             if work is None:
                 status["state"] = "تعذر قراءة مواعيد الفحص"
-                await asyncio.sleep(SCHEDULER_WAKE_SECONDS)
+                await asyncio.sleep(SCHEDULER_ERROR_RETRY_SECONDS)
                 continue
 
             status["categories"] = work["categories"]
@@ -664,7 +743,7 @@ async def monitor_mailboxes(connect, user_database, fetch_all, status=None):
                 else:
                     status["state"] = "بانتظار موعد الفحص"
                 status["pending_due"] = 0
-                await asyncio.sleep(SCHEDULER_WAKE_SECONDS)
+                await _idle_wait(wake, _next_idle_delay(work["next_check"]))
                 continue
 
             if not wave_active:
@@ -699,6 +778,12 @@ async def monitor_mailboxes(connect, user_database, fetch_all, status=None):
                     status["processed"] += 1
                     continue
                 uid, index = owner_and_index
+                latest = user_database.get(str(uid), {}).get("emails") or []
+                if index >= len(latest) or str(latest[index].get("address") or "").lower() != address:
+                    # The member changed mailbox order while a batch was running.
+                    notify_schedule_change(owners_changed=True)
+                    status["processed"] += 1
+                    continue
                 try:
                     result = await asyncio.to_thread(fetch_all, uid, index)
                 except asyncio.CancelledError:
@@ -753,4 +838,4 @@ async def monitor_mailboxes(connect, user_database, fetch_all, status=None):
         except Exception as error:
             status["state"] = "تعثر الفحص"
             print(f"⚠️ دورة الفحص الذكي: {type(error).__name__}: {error}")
-            await asyncio.sleep(SCHEDULER_WAKE_SECONDS)
+            await asyncio.sleep(SCHEDULER_ERROR_RETRY_SECONDS)

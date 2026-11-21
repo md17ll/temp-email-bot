@@ -1,5 +1,10 @@
+import ast
+import asyncio
 import os
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 from datetime import datetime, timezone, timedelta
 
 import psycopg2
@@ -314,6 +319,93 @@ class DashboardScannerTests(unittest.TestCase):
         self.assertIn("كل 12 ساعة", dashboard)
         self.assertIn('callback_data=f"member_msg_', source)
         self.assertIn("get_user_message_content, target_id", source)
+
+
+
+class ResourceEfficiencyTests(unittest.TestCase):
+    """No Railway services or real mail.tm calls; preserve exact user behavior."""
+
+    def test_idle_deadline_never_misses_earlier_scan(self):
+        now = datetime(2026, 11, 21, 12, 0, tzinfo=timezone.utc)
+        self.assertEqual(
+            analytics._next_idle_delay(now + timedelta(minutes=3), now), 180
+        )
+        self.assertEqual(
+            analytics._next_idle_delay(now + timedelta(hours=12), now), 600
+        )
+        self.assertEqual(
+            analytics._next_idle_delay(None, now), 600
+        )
+        self.assertEqual(
+            analytics._next_idle_delay(now - timedelta(seconds=3), now), 0.25
+        )
+
+    def test_event_wakes_idle_scanner_without_another_worker(self):
+        async def scenario():
+            event = asyncio.Event()
+            task = asyncio.create_task(analytics._idle_wait(event, 600))
+            await asyncio.sleep(0)
+            event.set()
+            await asyncio.wait_for(task, 1)
+            self.assertFalse(event.is_set())
+
+        asyncio.run(scenario())
+
+    def test_member_profile_is_not_rewritten_without_change(self):
+        tree = ast.parse(Path("telegram_bot.py").read_text(encoding="utf-8"))
+        fn = next(node for node in tree.body
+                  if isinstance(node, ast.FunctionDef)
+                  and node.name == "update_user_info")
+        data = {
+            "lang": "ar", "first_name": "Samer", "last_name": "",
+            "username": "samer", "emails": [
+                {"address": "x@example.com", "token": "dont-change"}
+            ]
+        }
+        records = {"7": data}
+        saved = []
+        scope = {
+            "get_user_data": lambda user_id: records[str(user_id)],
+            "user_database": records,
+            "save_single_user": lambda uid, row: saved.append((uid, row.copy())),
+        }
+        exec(compile(ast.Module(body=[fn], type_ignores=[]),
+                     "telegram_bot.py", "exec"), scope)
+        update = scope["update_user_info"]
+        user = SimpleNamespace(first_name="Samer", last_name="", username="samer")
+        update(7, user)
+        self.assertEqual(saved, [])
+        user.username = "newname"
+        update(7, user)
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(records["7"]["emails"][0]["address"], "x@example.com")
+
+    def test_telegram_subscription_checks_remain_and_no_job_queue_is_used(self):
+        source = Path("telegram_bot.py").read_text(encoding="utf-8")
+        self.assertIn("get_chat_member(chat_identifier, user_id)", source)
+        self.assertIn("channels=active_channels", source)
+        self.assertIn("def get_missing_subscription_channels(", source)
+        self.assertIn("notify_schedule_change(owners_changed=True)", source)
+        self.assertIn("mail_analytics.notify_schedule_change()", source)
+        self.assertIn("get_user_message_content", source)
+        self.assertNotIn("run_repeating(", source)
+        self.assertNotIn("job_queue.run_", source)
+
+    def test_http_session_is_worker_local(self):
+        tree = ast.parse(Path("telegram_bot.py").read_text(encoding="utf-8"))
+        fn = next(node for node in tree.body
+                  if isinstance(node, ast.FunctionDef)
+                  and node.name == "_mail_session")
+        import requests
+        import threading
+        scope = {"_MAIL_HTTP_LOCAL": threading.local(), "requests": requests}
+        exec(compile(ast.Module(body=[fn], type_ignores=[]),
+                     "telegram_bot.py", "exec"), scope)
+        first = scope["_mail_session"]()
+        second = scope["_mail_session"]()
+        self.assertIs(first, second)
+        first.close()
+        # Test-local context only: production workers keep their own sessions.
 
 if __name__ == "__main__":
     unittest.main()
